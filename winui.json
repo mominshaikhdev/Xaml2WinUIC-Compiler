@@ -1,0 +1,666 @@
+{
+  "backend": "winui3",
+  "_doc": "Agnostic third-party control registry. Auto-loaded from any *.json next to winuic.exe. Covers both XAML TemplatedControls (with ResourceDictionary templates) and pure C++/WinRT components. No language is hardcoded — the .winmd is projection-agnostic and downstream projections (cppwinrtc, pywinrtc, winrs, etc.) handle language-specific codegen. Built-in WinUI 3 controls (Grid, Button, TextBlock, etc.) are compiled in — only register controls NOT in the built-in registry.",
+  "_schema": {
+    "abstract_name": "Name used in .winui source (required)",
+    "platform_type": "WinRT class name to instantiate (required)",
+    "platform_namespace": "Full WinRT namespace",
+    "type": "xaml = XAML TemplatedControl with ResourceDictionary; cpp = pure C++/WinRT component (default: cpp)",
+    "accepts_children": "bool — can hold child elements (default: false)",
+    "accepts_text_content": "bool — can hold inline text (default: false)",
+    "category": "layout | content | input | navigation | collections | menus | feedback | flyout | dialog | custom",
+    "fixed_properties": "[{name, value}] — always set on the control",
+    "properties": "[{abstract_name, platform_setter, transform, type}] — named arguments",
+    "events": "[{abstract_name, platform_event}] — .onX { } closures",
+    "template_resource_key": "x:Key in ResourceDictionary (xaml controls only)",
+    "resource_dictionary": "relative path to .xaml in package (xaml controls only)",
+    "_note": "Downstream projection reads 'type' to emit ResourceDictionary merge (xaml) or direct instantiation (cpp). The .winmd carries no language-specific code.",
+    "_transforms": "double | int | box | brush | thickness | corner_radius | enum | symbol | font_weight | visibility | nullable_bool | datetime | uri | geopoint"
+  },
+  "controls": [
+
+    {
+      "_doc": "===== WinUIEssentials (HO-COOH/WinUIEssentials) — XAML TemplatedControls =====",
+      "_section": "WINUIESSENTIALS_XAML"
+    },
+
+    {
+      "_doc": "Settings card control. WinUI3 only (v1.5+ auto-loads resources). Source: HO-COOH/WinUIEssentials. NuGet: WinUIEssential.WinUI3",
+      "abstract_name": "SettingsCard",
+      "platform_type": "SettingsCard",
+      "platform_namespace": "WinUIEssential.Controls",
+      "type": "xaml",
+      "template_resource_key": "SettingsCardTemplate",
+      "resource_dictionary": "Themes/Generic.xaml",
+      "accepts_children": true,
+      "category": "content",
+      "properties": [
+        { "abstract_name": "header", "platform_setter": "Header", "type": "any" },
+        { "abstract_name": "description", "platform_setter": "Description", "type": "string" },
+        { "abstract_name": "headerIcon", "platform_setter": "HeaderIcon", "type": "any" },
+        { "abstract_name": "isClickEnabled", "platform_setter": "IsClickEnabled", "transform": "bool", "type": "bool" },
+        { "abstract_name": "contentAlignment", "platform_setter": "ContentAlignment", "transform": "enum", "type": "string" }
+      ],
+      "events": [
+        { "abstract_name": "onClick", "platform_event": "Click" }
+      ]
+    },
+
+    {
+      "_doc": "Collapsible settings card with ItemsSource. WinUI3 only (v1.5+ auto-loads resources).",
+      "abstract_name": "SettingsExpander",
+      "platform_type": "SettingsExpander",
+      "platform_namespace": "WinUIEssential.Controls",
+      "type": "xaml",
+      "template_resource_key": "SettingsExpanderTemplate",
+      "resource_dictionary": "Themes/Generic.xaml",
+      "accepts_children": true,
+      "category": "content",
+      "properties": [
+        { "abstract_name": "header", "platform_setter": "Header", "type": "any" },
+        { "abstract_name": "description", "platform_setter": "Description", "type": "string" },
+        { "abstract_name": "headerIcon", "platform_setter": "HeaderIcon", "type": "any" },
+        { "abstract_name": "isExpanded", "platform_setter": "IsExpanded", "transform": "bool", "type": "bool" },
+        { "abstract_name": "itemsSource", "platform_setter": "ItemsSource", "transform": "box", "type": "any" }
+      ],
+      "events": [
+        { "abstract_name": "onClick", "platform_event": "Click" },
+        { "abstract_name": "onExpanding", "platform_event": "Expanding" }
+      ]
+    },
+
+    {
+      "_doc": "iOS-style segmented picker control.",
+      "abstract_name": "Segmented",
+      "platform_type": "Segmented",
+      "platform_namespace": "WinUIEssential.Controls",
+      "type": "xaml",
+      "template_resource_key": "SegmentedTemplate",
+      "resource_dictionary": "Themes/Generic.xaml",
+      "accepts_children": true,
+      "category": "input",
+      "properties": [
+        { "abstract_name": "selectedIndex", "platform_setter": "SelectedIndex", "transform": "int", "type": "int" },
+        { "abstract_name": "isCompact", "platform_setter": "IsCompact", "transform": "bool", "type": "bool" }
+      ],
+      "events": [
+        { "abstract_name": "onSelectionChanged", "platform_event": "SelectionChanged" }
+      ]
+    },
+
+    {
+      "_doc": "Loading placeholder skeleton shimmer effect.",
+      "abstract_name": "Shimmer",
+      "platform_type": "Shimmer",
+      "platform_namespace": "WinUIEssential.Controls",
+      "type": "xaml",
+      "template_resource_key": "ShimmerTemplate",
+      "resource_dictionary": "Themes/Generic.xaml",
+      "accepts_children": false,
+      "category": "feedback"
+    },
+
+    {
+      "_doc": "Flow layout panel wrapping children to next row/column.",
+      "abstract_name": "WrapPanel",
+      "platform_type": "WrapPanel",
+      "platform_namespace": "WinUIEssential.Controls",
+      "type": "xaml",
+      "template_resource_key": "WrapPanelTemplate",
+      "resource_dictionary": "Themes/Generic.xaml",
+      "accepts_children": true,
+      "category": "layout",
+      "properties": [
+        { "abstract_name": "orientation", "platform_setter": "Orientation", "transform": "enum", "type": "string" },
+        { "abstract_name": "itemWidth", "platform_setter": "ItemWidth", "type": "double" },
+        { "abstract_name": "itemHeight", "platform_setter": "ItemHeight", "type": "double" },
+        { "abstract_name": "horizontalChildrenAlignment", "platform_setter": "HorizontalChildrenAlignment", "transform": "enum", "type": "string" },
+        { "abstract_name": "verticalChildrenAlignment", "platform_setter": "VerticalChildrenAlignment", "transform": "enum", "type": "string" }
+      ]
+    },
+
+    {
+      "_doc": "Content presenter that switches visibility based on a value.",
+      "abstract_name": "SwitchPresenter",
+      "platform_type": "SwitchPresenter",
+      "platform_namespace": "WinUIEssential.Controls",
+      "type": "xaml",
+      "template_resource_key": "SwitchPresenterTemplate",
+      "resource_dictionary": "Themes/Generic.xaml",
+      "accepts_children": true,
+      "category": "content",
+      "properties": [
+        { "abstract_name": "value", "platform_setter": "Value", "type": "any" },
+        { "abstract_name": "contentType", "platform_setter": "ContentType", "type": "any" },
+        { "abstract_name": "transition", "platform_setter": "Transition", "transform": "enum", "type": "string" }
+      ]
+    },
+
+    {
+      "_doc": "Scrolling/marquee text display.",
+      "abstract_name": "MarqueeText",
+      "platform_type": "MarqueeText",
+      "platform_namespace": "WinUIEssential.Controls",
+      "type": "xaml",
+      "template_resource_key": "MarqueeTextTemplate",
+      "resource_dictionary": "Themes/Generic.xaml",
+      "accepts_children": false,
+      "category": "content",
+      "properties": [
+        { "abstract_name": "text", "platform_setter": "Text", "type": "string" },
+        { "abstract_name": "fontSize", "platform_setter": "FontSize", "type": "double" },
+        { "abstract_name": "speed", "platform_setter": "Speed", "type": "double" },
+        { "abstract_name": "repeatBehavior", "platform_setter": "RepeatBehavior", "type": "any" }
+      ]
+    },
+
+    {
+      "_doc": "Extended progress bar with percentage text.",
+      "abstract_name": "ProgressBarEx",
+      "platform_type": "ProgressBarEx",
+      "platform_namespace": "WinUIEssential.Controls",
+      "type": "xaml",
+      "template_resource_key": "ProgressBarExTemplate",
+      "resource_dictionary": "Themes/Generic.xaml",
+      "accepts_children": false,
+      "category": "feedback",
+      "properties": [
+        { "abstract_name": "value", "platform_setter": "Value", "type": "double" },
+        { "abstract_name": "minimum", "platform_setter": "Minimum", "type": "double" },
+        { "abstract_name": "maximum", "platform_setter": "Maximum", "type": "double" },
+        { "abstract_name": "isIndeterminate", "platform_setter": "IsIndeterminate", "transform": "bool", "type": "bool" },
+        { "abstract_name": "showPercentage", "platform_setter": "ShowPercentage", "transform": "bool", "type": "bool" }
+      ]
+    },
+
+    {
+      "_doc": "Visual group container with header.",
+      "abstract_name": "GroupBox",
+      "platform_type": "GroupBox",
+      "platform_namespace": "WinUIEssential.Controls",
+      "type": "xaml",
+      "template_resource_key": "GroupBoxTemplate",
+      "resource_dictionary": "Themes/Generic.xaml",
+      "accepts_children": true,
+      "category": "layout",
+      "properties": [
+        { "abstract_name": "header", "platform_setter": "Header", "type": "any" }
+      ]
+    },
+
+    {
+      "_doc": "Panel with reveal focus border effect.",
+      "abstract_name": "RevealFocusPanel",
+      "platform_type": "RevealFocusPanel",
+      "platform_namespace": "WinUIEssential.Controls",
+      "type": "xaml",
+      "template_resource_key": "RevealFocusPanelTemplate",
+      "resource_dictionary": "Themes/Generic.xaml",
+      "accepts_children": true,
+      "category": "layout"
+    },
+
+    {
+      "_doc": "Content dialog in its own window.",
+      "abstract_name": "WindowedContentDialog",
+      "platform_type": "WindowedContentDialog",
+      "platform_namespace": "WinUIEssential.Controls",
+      "type": "xaml",
+      "template_resource_key": "WindowedContentDialogTemplate",
+      "resource_dictionary": "Themes/Generic.xaml",
+      "accepts_children": true,
+      "category": "dialog",
+      "properties": [
+        { "abstract_name": "title", "platform_setter": "Title", "type": "string" },
+        { "abstract_name": "closeButtonText", "platform_setter": "CloseButtonText", "type": "string" },
+        { "abstract_name": "primaryButtonText", "platform_setter": "PrimaryButtonText", "type": "string" },
+        { "abstract_name": "secondaryButtonText", "platform_setter": "SecondaryButtonText", "type": "string" },
+        { "abstract_name": "isPrimaryButtonEnabled", "platform_setter": "IsPrimaryButtonEnabled", "transform": "bool", "type": "bool" }
+      ],
+      "events": [
+        { "abstract_name": "onPrimaryButtonClicked", "platform_event": "PrimaryButtonClick" },
+        { "abstract_name": "onSecondaryButtonClicked", "platform_event": "SecondaryButtonClick" },
+        { "abstract_name": "onCloseButtonClicked", "platform_event": "CloseButtonClick" }
+      ]
+    },
+
+    {
+      "_doc": "WebView2 wrapper for WinUI3.",
+      "abstract_name": "WinUIEssentialsWebView",
+      "platform_type": "WebView",
+      "platform_namespace": "WinUIEssential.Controls",
+      "type": "xaml",
+      "template_resource_key": "WebViewTemplate",
+      "resource_dictionary": "Themes/Generic.xaml",
+      "accepts_children": false,
+      "category": "content",
+      "properties": [
+        { "abstract_name": "source", "platform_setter": "Source", "transform": "uri", "type": "string" }
+      ],
+      "events": [
+        { "abstract_name": "onNavigationCompleted", "platform_event": "NavigationCompleted" },
+        { "abstract_name": "onNavigationStarting", "platform_event": "NavigationStarting" }
+      ]
+    },
+
+    {
+      "_doc": "===== WinUIEssentials — C++/WinRT Components =====",
+      "_section": "WINUIESSENTIALS_CPP"
+    },
+
+    {
+      "_doc": "Programmatic cursor shape control.",
+      "abstract_name": "CursorController",
+      "platform_type": "CursorController",
+      "platform_namespace": "WinUIEssential",
+      "type": "cpp",
+      "accepts_children": false,
+      "category": "custom",
+      "properties": [
+        { "abstract_name": "cursorShape", "platform_setter": "CursorShape", "transform": "enum", "type": "string" }
+      ]
+    },
+
+    {
+      "_doc": "WeakReference-based INotifyPropertyChanged helper.",
+      "abstract_name": "PropertyChangeHelper",
+      "platform_type": "PropertyChangeHelper",
+      "platform_namespace": "WinUIEssential",
+      "type": "cpp",
+      "accepts_children": false,
+      "category": "custom"
+    },
+
+    {
+      "_doc": "CRTP helper for TemplatedControl DefaultStyleKey.",
+      "abstract_name": "TemplateControlHelper",
+      "platform_type": "TemplateControlHelper",
+      "platform_namespace": "WinUIEssential",
+      "type": "cpp",
+      "accepts_children": false,
+      "category": "custom"
+    },
+
+    {
+      "_doc": "Strongly-typed Segoe MDL2 glyph constants.",
+      "abstract_name": "BadgeGlyphs",
+      "platform_type": "BadgeGlyphs",
+      "platform_namespace": "WinUIEssential.Glyphs",
+      "type": "cpp",
+      "accepts_children": false,
+      "category": "custom"
+    },
+
+    {
+      "_doc": "Declarative toast notification builder API.",
+      "abstract_name": "ToastBuilder",
+      "platform_type": "ToastBuilder",
+      "platform_namespace": "WinUIEssential.Toast",
+      "type": "cpp",
+      "accepts_children": false,
+      "category": "custom",
+      "properties": [
+        { "abstract_name": "duration", "platform_setter": "Duration", "transform": "enum", "type": "string" },
+        { "abstract_name": "scenario", "platform_setter": "Scenario", "transform": "enum", "type": "string" }
+      ]
+    },
+
+    {
+      "_doc": "Strongly-typed toast notification templates.",
+      "abstract_name": "ToastTemplates",
+      "platform_type": "ToastTemplates",
+      "platform_namespace": "WinUIEssential.Toast",
+      "type": "cpp",
+      "accepts_children": false,
+      "category": "custom"
+    },
+
+    {
+      "_doc": "Strongly-typed tile notification builder.",
+      "abstract_name": "TileBuilder",
+      "platform_type": "TileBuilder",
+      "platform_namespace": "WinUIEssential.Tile",
+      "type": "cpp",
+      "accepts_children": false,
+      "category": "custom"
+    },
+
+    {
+      "_doc": "Strongly-typed tile notification templates.",
+      "abstract_name": "TileTemplates",
+      "platform_type": "TileTemplates",
+      "platform_namespace": "WinUIEssential.Tile",
+      "type": "cpp",
+      "accepts_children": false,
+      "category": "custom"
+    },
+
+    {
+      "_doc": "Bool-to-Visibility converter.",
+      "abstract_name": "BoolToVisibilityConverter",
+      "platform_type": "BoolToVisibilityConverter",
+      "platform_namespace": "WinUIEssential",
+      "type": "cpp",
+      "accepts_children": false,
+      "category": "custom"
+    },
+
+    {
+      "_doc": "String-to-Bool converter.",
+      "abstract_name": "StringToBoolConverter",
+      "platform_type": "StringToBoolConverter",
+      "platform_namespace": "WinUIEssential",
+      "type": "cpp",
+      "accepts_children": false,
+      "category": "custom"
+    },
+
+    {
+      "_doc": "IsNullOrEmpty state trigger.",
+      "abstract_name": "IsNullOrEmptyStateTrigger",
+      "platform_type": "IsNullOrEmptyStateTrigger",
+      "platform_namespace": "WinUIEssential",
+      "type": "cpp",
+      "accepts_children": false,
+      "category": "custom"
+    },
+
+    {
+      "_doc": "Control size trigger.",
+      "abstract_name": "ControlSizeTrigger",
+      "platform_type": "ControlSizeTrigger",
+      "platform_namespace": "WinUIEssential",
+      "type": "cpp",
+      "accepts_children": false,
+      "category": "custom"
+    },
+
+    {
+      "_doc": "FontIcon extension helper.",
+      "abstract_name": "FontIconExtension",
+      "platform_type": "FontIconExtension",
+      "platform_namespace": "WinUIEssential",
+      "type": "cpp",
+      "accepts_children": false,
+      "category": "custom"
+    },
+
+    {
+      "_doc": "Dependent value helper.",
+      "abstract_name": "DependentValue",
+      "platform_type": "DependentValue",
+      "platform_namespace": "WinUIEssential",
+      "type": "cpp",
+      "accepts_children": false,
+      "category": "custom"
+    },
+
+    {
+      "_doc": "Mica backdrop with fallback for older Windows builds.",
+      "abstract_name": "MicaBackdropWithFallback",
+      "platform_type": "MicaBackdropWithFallback",
+      "platform_namespace": "WinUIEssential",
+      "type": "cpp",
+      "accepts_children": false,
+      "category": "custom"
+    },
+
+    {
+      "_doc": "Fully transparent window backdrop.",
+      "abstract_name": "TransparentBackdrop",
+      "platform_type": "TransparentBackdrop",
+      "platform_namespace": "WinUIEssential",
+      "type": "cpp",
+      "accepts_children": false,
+      "category": "custom"
+    },
+
+    {
+      "_doc": "Custom Mica variant backdrop.",
+      "abstract_name": "CustomMicaBackdrop",
+      "platform_type": "CustomMicaBackdrop",
+      "platform_namespace": "WinUIEssential",
+      "type": "cpp",
+      "accepts_children": false,
+      "category": "custom"
+    },
+
+    {
+      "_doc": "Custom Acrylic variant backdrop.",
+      "abstract_name": "CustomAcrylicBackdrop",
+      "platform_type": "CustomAcrylicBackdrop",
+      "platform_namespace": "WinUIEssential",
+      "type": "cpp",
+      "accepts_children": false,
+      "category": "custom"
+    },
+
+    {
+      "_doc": "Extended window with custom features.",
+      "abstract_name": "WindowEx",
+      "platform_type": "WindowEx",
+      "platform_namespace": "WinUIEssential",
+      "type": "cpp",
+      "accepts_children": false,
+      "category": "custom"
+    },
+
+    {
+      "_doc": "SVG image source helper.",
+      "abstract_name": "SvgImageSource",
+      "platform_type": "SvgImageSource",
+      "platform_namespace": "WinUIEssential",
+      "type": "cpp",
+      "accepts_children": false,
+      "category": "custom"
+    },
+
+    {
+      "_doc": "Image extension helper.",
+      "abstract_name": "ImageExtension",
+      "platform_type": "ImageExtension",
+      "platform_namespace": "WinUIEssential",
+      "type": "cpp",
+      "accepts_children": false,
+      "category": "custom"
+    },
+
+    {
+      "_doc": "Window context menu helper.",
+      "abstract_name": "WindowContextMenu",
+      "platform_type": "WindowContextMenu",
+      "platform_namespace": "WinUIEssential",
+      "type": "cpp",
+      "accepts_children": false,
+      "category": "custom"
+    },
+
+    {
+      "_doc": "Modal window helper.",
+      "abstract_name": "ModalWindow",
+      "platform_type": "ModalWindow",
+      "platform_namespace": "WinUIEssential",
+      "type": "cpp",
+      "accepts_children": false,
+      "category": "custom"
+    },
+
+    {
+      "_doc": "NavigationView helper.",
+      "abstract_name": "NavigationViewHelper",
+      "platform_type": "NavigationViewHelper",
+      "platform_namespace": "WinUIEssential",
+      "type": "cpp",
+      "accepts_children": false,
+      "category": "custom"
+    },
+
+    {
+      "_doc": "Slider helper.",
+      "abstract_name": "SliderHelper",
+      "platform_type": "SliderHelper",
+      "platform_namespace": "WinUIEssential",
+      "type": "cpp",
+      "accepts_children": false,
+      "category": "custom"
+    },
+
+    {
+      "_doc": "Taskbar integration helper (WinUI3 only).",
+      "abstract_name": "Taskbar",
+      "platform_type": "Taskbar",
+      "platform_namespace": "WinUIEssential",
+      "type": "cpp",
+      "accepts_children": false,
+      "category": "custom"
+    },
+
+    {
+      "_doc": "===== CommunityToolkit.WinUI3 (CommunityToolkit/Windows) =====",
+      "_section": "COMMUNITY_TOOLKIT"
+    },
+
+    {
+      "_doc": "Camera preview and capture control.",
+      "abstract_name": "CameraView",
+      "platform_type": "CameraView",
+      "platform_namespace": "CommunityToolkit.WinUI.Controls.Camera",
+      "type": "xaml",
+      "template_resource_key": "CameraViewTemplate",
+      "resource_dictionary": "Themes/Generic.xaml",
+      "accepts_children": false,
+      "category": "content",
+      "properties": [
+        { "abstract_name": "isPreviewing", "platform_setter": "IsPreviewing", "transform": "bool", "type": "bool" },
+        { "abstract_name": "isMirrored", "platform_setter": "IsMirrored", "transform": "bool", "type": "bool" }
+      ],
+      "events": [
+        { "abstract_name": "onPreviewFailed", "platform_event": "PreviewFailed" },
+        { "abstract_name": "onPhotoCaptured", "platform_event": "PhotoCaptured" }
+      ]
+    },
+
+    {
+      "_doc": "Extended TextBlock with Markdown, auto-link, text selection.",
+      "abstract_name": "RichTextBlock",
+      "platform_type": "RichTextBlock",
+      "platform_namespace": "CommunityToolkit.WinUI.Controls.Text",
+      "type": "xaml",
+      "template_resource_key": "RichTextBlockTemplate",
+      "resource_dictionary": "Themes/Generic.xaml",
+      "accepts_children": false,
+      "category": "content",
+      "properties": [
+        { "abstract_name": "text", "platform_setter": "Text", "type": "string" },
+        { "abstract_name": "isTextSelectionEnabled", "platform_setter": "IsTextSelectionEnabled", "transform": "bool", "type": "bool" },
+        { "abstract_name": "isMarkdownEnabled", "platform_setter": "IsMarkdownEnabled", "transform": "bool", "type": "bool" },
+        { "abstract_name": "isAutoLinkEnabled", "platform_setter": "IsAutoLinkEnabled", "transform": "bool", "type": "bool" }
+      ]
+    },
+
+    {
+      "_doc": "Cached, rounded, placeholder image control.",
+      "abstract_name": "ImageEx",
+      "platform_type": "ImageEx",
+      "platform_namespace": "CommunityToolkit.WinUI.Controls.Images",
+      "type": "xaml",
+      "template_resource_key": "ImageExTemplate",
+      "resource_dictionary": "Themes/Generic.xaml",
+      "accepts_children": false,
+      "category": "content",
+      "properties": [
+        { "abstract_name": "source", "platform_setter": "Source", "transform": "uri", "type": "string" },
+        { "abstract_name": "placeholderSource", "platform_setter": "PlaceholderSource", "transform": "uri", "type": "string" },
+        { "abstract_name": "placeholderStretch", "platform_setter": "PlaceholderStretch", "transform": "enum", "type": "string" },
+        { "abstract_name": "isCircular", "platform_setter": "IsCircular", "transform": "bool", "type": "bool" },
+        { "abstract_name": "cornerRadius", "platform_setter": "CornerRadius", "transform": "corner_radius", "type": "double" }
+      ]
+    },
+
+    {
+      "_doc": "Drop target border with visual feedback.",
+      "abstract_name": "DroppableBorder",
+      "platform_type": "DroppableBorder",
+      "platform_namespace": "CommunityToolkit.WinUI.Controls.Primitives",
+      "type": "xaml",
+      "template_resource_key": "DroppableBorderTemplate",
+      "resource_dictionary": "Themes/Generic.xaml",
+      "accepts_children": true,
+      "category": "custom",
+      "events": [
+        { "abstract_name": "onDragEnter", "platform_event": "DragEnter" },
+        { "abstract_name": "onDragLeave", "platform_event": "DragLeave" },
+        { "abstract_name": "onDrop", "platform_event": "Drop" }
+      ]
+    },
+
+    {
+      "_doc": "===== Charting / Data Visualization =====",
+      "_section": "CHARTING"
+    },
+
+    {
+      "_doc": "SkiaSharp-based charting control. Source: LiveCharts2/LiveCharts2.",
+      "abstract_name": "LiveCharts",
+      "platform_type": "CartesianChart",
+      "platform_namespace": "LiveChartsCore.SkiaSharpView.WinUI",
+      "type": "xaml",
+      "template_resource_key": "CartesianChartTemplate",
+      "resource_dictionary": "Themes/Generic.xaml",
+      "accepts_children": false,
+      "category": "custom",
+      "properties": [
+        { "abstract_name": "series", "platform_setter": "Series", "transform": "box", "type": "any[]" },
+        { "abstract_name": "xAxes", "platform_setter": "XAxes", "transform": "box", "type": "any[]" },
+        { "abstract_name": "yAxes", "platform_setter": "YAxes", "transform": "box", "type": "any[]" },
+        { "abstract_name": "tooltipPosition", "platform_setter": "TooltipPosition", "transform": "enum", "type": "string" }
+      ],
+      "events": [
+        { "abstract_name": "onDataPointerDown", "platform_event": "DataPointerDown" },
+        { "abstract_name": "onChartPointPointerDown", "platform_event": "ChartPointPointerDown" }
+      ]
+    },
+
+    {
+      "_doc": "OxyPlot charting for WinUI3.",
+      "abstract_name": "OxyPlot",
+      "platform_type": "PlotView",
+      "platform_namespace": "OxyPlot.WinUI",
+      "type": "cpp",
+      "accepts_children": false,
+      "category": "custom",
+      "properties": [
+        { "abstract_name": "model", "platform_setter": "Model", "transform": "box", "type": "any" }
+      ],
+      "events": [
+        { "abstract_name": "onTrackerChanged", "platform_event": "TrackerChanged" }
+      ]
+    },
+
+    {
+      "_doc": "===== Web / Media =====",
+      "_section": "WEB_MEDIA"
+    },
+
+    {
+      "_doc": "Chromium-based embedded browser. Source: Microsoft/WebView2.",
+      "abstract_name": "SMBrowser",
+      "platform_type": "WebView2",
+      "platform_namespace": "Microsoft.Web.WebView2.Core",
+      "type": "xaml",
+      "template_resource_key": "WebView2Template",
+      "resource_dictionary": "Themes/Generic.xaml",
+      "accepts_children": false,
+      "category": "content",
+      "properties": [
+        { "abstract_name": "source", "platform_setter": "Source", "transform": "uri", "type": "string" },
+        { "abstract_name": "isPrivateModeEnabled", "platform_setter": "IsPrivateModeEnabled", "transform": "bool", "type": "bool" }
+      ],
+      "events": [
+        { "abstract_name": "onNavigationCompleted", "platform_event": "NavigationCompleted" },
+        { "abstract_name": "onNavigationStarting", "platform_event": "NavigationStarting" },
+        { "abstract_name": "onCoreWebView2Initialized", "platform_event": "CoreWebView2Initialized" }
+      ]
+    }
+  ]
+}
