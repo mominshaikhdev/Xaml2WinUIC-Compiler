@@ -260,9 +260,14 @@ inline auto parse(std::string_view src) -> ParseResult {
                         ++pos;
                     }
                     if (at() == '>') ++pos;
-                    // trim whitespace in name (there normally isn't any)
-                    while (!close_name.empty() && (close_name.back() == ' ' || close_name.back() == '\t'))
+                    // trim whitespace in name (both leading and trailing)
+                    while (!close_name.empty() && (close_name.back() == ' ' || close_name.back() == '\t' || close_name.back() == '\r' || close_name.back() == '\n'))
                         close_name.pop_back();
+                    auto close_start = close_name.find_first_not_of(" \t\r\n");
+                    if (close_start != std::string::npos && close_start > 0)
+                        close_name.erase(0, close_start);
+                    else if (close_start == std::string::npos)
+                        close_name.clear();
                     // compare local names
                     std::string close_local = close_name;
                     auto colon = close_name.find(':');
@@ -354,15 +359,22 @@ inline auto parse(std::string_view src) -> ParseResult {
                 }
                 if (!only_ws) {
                     std::string trimmed = decode_entities(t);
-                    // trim leading/trailing whitespace/newlines around
-                    auto strip = [](std::string s) {
-                        auto b = s.find_first_not_of(" \t\r\n");
-                        auto e = s.find_last_not_of(" \t\r\n");
-                        if (b == std::string::npos) return std::string();
-                        return s.substr(b, e - b + 1);
-                    };
-                    trimmed = strip(trimmed);
-                    if (!trimmed.empty()) node.text.push_back(std::move(trimmed));
+                    bool has_leading_ws = (!t.empty() && (t.front() == ' ' || t.front() == '\t' || t.front() == '\r' || t.front() == '\n'));
+                    bool has_trailing_ws = (!t.empty() && (t.back() == ' ' || t.back() == '\t' || t.back() == '\r' || t.back() == '\n'));
+                    std::string collapsed;
+                    collapsed.reserve(trimmed.size());
+                    bool in_ws = false;
+                    for (char ch : trimmed) {
+                        if (ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n') {
+                            if (!in_ws) { collapsed += ' '; in_ws = true; }
+                        } else {
+                            collapsed += ch;
+                            in_ws = false;
+                        }
+                    }
+                    if (has_leading_ws && (collapsed.empty() || collapsed.front() != ' ')) collapsed.insert(collapsed.begin(), ' ');
+                    if (has_trailing_ws && (collapsed.empty() || collapsed.back() != ' ')) collapsed.push_back(' ');
+                    if (!collapsed.empty() && collapsed != " ") node.text.push_back(std::move(collapsed));
                 }
             }
         }

@@ -70,6 +70,7 @@ export struct ConvertOptions {
     std::string language;          // "csharp" | "cpp" (code-behind dialect)
     bool        emit_resources = true;  // resource dictionaries → resource views
     std::string source_file_path;  // absolute path to source XAML file
+    bool        emit_control_view = false; // also emit the code-behind control class view
 };
 
 export struct ConvertResult {
@@ -104,20 +105,12 @@ inline auto escape_winui_string(std::string_view s) -> std::string {
         char c = s[i];
         if (c == '"') {
             out += "\\\"";
-        } else if (c == '\\') {
-            // decide whether the next sequence would be re-interpreted
-            bool need_double = (i + 1 >= s.size());           // trailing backslash
-            if (!need_double && s[i + 1] == '(') need_double = true;
-            if (!need_double && s[i + 1] == '"') need_double = true;
-            if (!need_double && s[i + 1] == 'u') {
-                bool hex4 = true;
-                for (int k = 1; k <= 4 && hex4; ++k) {
-                    char h = (i + 1 + k < s.size()) ? s[i + 1 + k] : '\0';
-                    hex4 = (h >= '0' && h <= '9') || (h >= 'a' && h <= 'f') || (h >= 'A' && h <= 'F');
-                }
-                if (hex4) need_double = true;
-            }
-            out += need_double ? "\\\\" : "\\";
+        } else if (c == '\r') {
+            // omit or keep
+        } else if (c == '\n') {
+            out += "\\n";
+        } else if (c == '\\' && i + 1 == s.size()) {
+            out += "\\ ";
         } else {
             out += c;
         }
@@ -152,7 +145,7 @@ inline auto is_frag_family(std::string_view name) -> bool {
     static constexpr std::string_view frags[] = {
         "Style", "Setter", "SolidColorBrush", "LinearGradientBrush",
         "RadialGradientBrush", "GradientStop", "Thickness", "GridLength",
-        "TransitionCollection", "VisualState", "VisualStateGroup",
+        "TransitionCollection", "BrushTransition", "VisualState", "VisualStateGroup",
         "VisualStateGroupList", "VisualStateManager", "Storyboard", "Color",
         "DoubleAnimation", "ObjectAnimationUsingKeyFrames", "ColorAnimation",
         "ThemeAnimation", "Timeline", "EasingFunctionBase", "FontWeight",
@@ -237,16 +230,20 @@ inline auto is_ident(std::string_view s) -> bool {
 struct ValueExpr {
     std::string expr;      // emitted expression ("" if unconvertible → comment)
     std::string comment;   // optional comment text
+    std::string target_null; // TargetNullValue for fallback/initial value
     bool is_binding = false;
     bool is_resource_ref = false;
+    std::string resource_key;
 };
 
 // Parses "{x:Bind Path, Mode=...}" / "{Binding Path}" into a .winui expr.
 // Element bindings "{Binding ElementName=X, Path=P}" become "x.p".
 // Returns: expression text using `root`-relative state vars; empty if failed.
-inline auto translate_binding(std::string_view inner, std::string& out_mode) -> std::string {
+inline auto translate_binding(std::string_view inner, std::string& out_mode,
+                              std::string* out_target_null = nullptr) -> std::string {
     std::string body(inner);
     out_mode = "";
+    if (out_target_null) *out_target_null = "";
 
     // Strip the binding keyword: "x:Bind Title" / "Binding Title" (braces are
     // already removed by callers). Must happen before any path translation,
@@ -284,6 +281,28 @@ inline auto translate_binding(std::string_view inner, std::string& out_mode) -> 
     }
     out_mode = mode;
 
+    // Extract "TargetNullValue='...'" or 'TargetNullValue="..."' anywhere in the body.
+    if (out_target_null) {
+        std::size_t tnp = std::string::npos;
+        for (std::size_t i = 0; (i = body.find("TargetNullValue=", i)) != std::string::npos; ++i) {
+            if (is_word_boundary(i)) { tnp = i; break; }
+        }
+        if (tnp != std::string::npos) {
+            std::string tnv = body.substr(tnp + 16);
+            auto tb = tnv.find_first_not_of(" \t");
+            if (tb != std::string::npos) {
+                char quote = tnv[tb];
+                if (quote == '\'' || quote == '"') {
+                    auto te = tnv.find(quote, tb + 1);
+                    if (te != std::string::npos) *out_target_null = tnv.substr(tb + 1, te - tb - 1);
+                } else {
+                    auto te = tnv.find_first_of(" \t,}");
+                    *out_target_null = (te == std::string::npos) ? tnv.substr(tb) : tnv.substr(tb, te - tb);
+                }
+            }
+        }
+    }
+
     // Translate a plain property path ("Path=X", "X.Y", "ns:X.Y(...)", casts).
     // Returns "" when the path cannot be faithfully expressed in .winui.
     auto translate_plain_path = [&](std::string path) -> std::string {
@@ -299,7 +318,7 @@ inline auto translate_binding(std::string_view inner, std::string& out_mode) -> 
         // is not a valid path — preserve the original as a comment instead.
         if (path.find('=') != std::string::npos) return {};
 
-        // Strip C# cast wrappers: "((ns:Type)X).Y" / "(ns:Type)X" → "X.Y"
+        // Strip C# cast wrappers: "((ns:Type)X).Y" / "(ns:Type)X" / "((Type)X).Y" / "(Type)X" → "X.Y"
         while (!path.empty() && path.front() == '(') {
             int depth = 0;
             std::size_t end = std::string::npos;
@@ -312,8 +331,17 @@ inline auto translate_binding(std::string_view inner, std::string& out_mode) -> 
             }
             if (end == std::string::npos) break;
             std::string inner = path.substr(1, end - 1);
-            if (inner.find(':') == std::string::npos) break;   // attached property, not a cast
-            path.erase(0, end + 1);
+            if (!inner.empty() && inner.front() == '(') {
+                // Outer parens of "((Type)Expr)": peel outer parens and keep trailing text
+                path = inner + path.substr(end + 1);
+                continue;
+            }
+            // Prefix type cast "(Type)Expr": after ')' is the target identifier
+            if (end + 1 < path.size() && (std::isalnum(static_cast<unsigned char>(path[end + 1])) || path[end + 1] == '_')) {
+                path.erase(0, end + 1);
+                continue;
+            }
+            break;
         }
 
         // Attached-property paths "(X.Y)" are not expressible → comment
@@ -440,6 +468,7 @@ inline auto convert_value(std::string_view raw, std::string_view attr_name,
             auto k_e = key.find_last_not_of(" \t");
             if (k_b != std::string::npos && k_e != std::string::npos) key = key.substr(k_b, k_e - k_b + 1);
             v.expr = qstr(key);
+            v.resource_key = key;
             v.is_resource_ref = true;
             return v;
         }
@@ -455,10 +484,12 @@ inline auto convert_value(std::string_view raw, std::string_view attr_name,
             kind = "Markup";
         }
         if (kind == "x:Bind" || kind == "Binding") {
-            std::string expr = translate_binding(inner, mode_out);
+            std::string target_null;
+            std::string expr = translate_binding(inner, mode_out, &target_null);
             if (!expr.empty()) {
                 v.expr = expr;
                 v.is_binding = true;
+                v.target_null = target_null;
                 return v;
             }
         }
@@ -484,6 +515,7 @@ inline auto convert_value(std::string_view raw, std::string_view attr_name,
             auto ke = key.find_last_not_of(" \t");
             if (kb != std::string::npos && ke != std::string::npos) key = key.substr(kb, ke - kb + 1);
             v.expr = qstr(key);
+            v.resource_key = key;
             v.is_resource_ref = true;
             return v;
         }
@@ -581,6 +613,18 @@ inline constexpr std::string_view g_event_names[] = {
     "NavigationCompleted", "WebMessageReceived", "MediaOpened", "MediaEnded",
     "MediaFailed", "MapLoaded", "MapTapped", "PreviewKeyDown", "KeyDown", "KeyUp",
     "SizeChanged", "GotFocus", "LostFocus", "PointerPressed", "PointerReleased",
+    "PointerEntered", "PointerExited", "ActualThemeChanged", "PreviewKeyUp",
+    "ContextRequested", "GettingFocus", "LayoutUpdated", "ImageOpened",
+    "Indeterminate", "IsTextTrimmedChanged", "IsCheckedChanged",
+    "DragEnter", "DragOver", "Drop", "DragItemsStarting",
+    "Navigated", "Navigating", "ViewChanged", "ScrollAnimationStarting",
+    "DisplayModeChanged", "PaneToggleRequested", "ActionButtonClick",
+    "ContainerContentChanging", "SelectedIndexChanged", "ExecuteRequested",
+    "AddTabButtonClick", "TabCloseRequested", "TabTearOutRequested",
+    "TabTearOutWindowRequested", "ExternalTornOutTabsDropped",
+    "ExternalTornOutTabsDropping", "BringIntoViewRequested",
+    "BeginningEdit", "CellEditEnding", "Invoked", "Sorted",
+    "ElementClearing", "ElementPrepared", "DetailLabelRequested",
     "IsEnabledChanged", "ViewChangeStarted", "ViewChangeCompleted", "ScrollViewerViewChanged",
 };
 
@@ -592,6 +636,41 @@ inline auto xaml_event_to_winui(std::string_view ev) -> std::string {
     std::string out = "on";
     out += std::string(ev);
     return out;
+}
+
+// Resolve an event attribute value to its handler name:
+//   "OnHover"          → "OnHover"
+//   "{x:Bind OnHover}" → "OnHover"   (x:Bind event → method syntax)
+// Anything else (bindings, markup extensions, bool literals) → "" — the
+// caller keeps such pairs as raw pass-throughs.
+inline auto event_handler_value(std::string_view v) -> std::string {
+    if (is_ident(v)) {
+        std::string s(v);
+        if (s == "True" || s == "False") return ""; // not a handler
+        return s;
+    }
+    if (v.size() > 2 && v.front() == '{' && v.back() == '}') {
+        std::string inner(v.substr(1, v.size() - 2));
+        auto b = inner.find_first_not_of(" \t\r\n");
+        if (b == std::string::npos) return "";
+        inner = inner.substr(b);
+        for (std::string_view kw : {"x:Bind", "Binding", "ThemeBinding", "TemplateBinding"}) {
+            if (inner.rfind(kw, 0) != 0) continue;
+            std::string rest = inner.substr(kw.size());
+            auto r0 = rest.find_first_not_of(" \t\r\n");
+            if (r0 == std::string::npos) return "";
+            rest = rest.substr(r0);
+            std::string tok;
+            for (char ch : rest) {
+                if (std::isalnum(static_cast<unsigned char>(ch)) || ch == '_') tok += ch;
+                else break;
+            }
+            // bare handler reference only — no args, no Mode= tail
+            if (!tok.empty() && tok.size() == rest.size()) return tok;
+            return "";
+        }
+    }
+    return "";
 }
 
 // §5  Code-behind integration
@@ -623,6 +702,7 @@ inline auto winui_type(lang::CsTypeKind k) -> std::string {
 // (see Converter::flatten_cb_path) instead of being carried as object types.
 inline auto normalize_cb_type(std::string const& raw) -> std::string {
     std::string t(raw);
+    while (!t.empty() && (t.back() == '?' || t.back() == ' ' || t.back() == '\t')) t.pop_back();
     auto strip_pref = [&](std::string_view p) {
         while (t.starts_with(p)) t = t.substr(p.size());
     };
@@ -630,6 +710,7 @@ inline auto normalize_cb_type(std::string const& raw) -> std::string {
     strip_pref("System.");
     if (t.starts_with("Platform::")) t = t.substr(10);
     if (!t.empty() && t.back() == '^') t.pop_back();
+    while (!t.empty() && (t.back() == '?' || t.back() == ' ' || t.back() == '\t')) t.pop_back();
 
     // generic collections: head<element>
     if (auto lt = t.find('<'); lt != std::string::npos && !t.empty() && t.back() == '>') {
@@ -650,6 +731,8 @@ inline auto normalize_cb_type(std::string const& raw) -> std::string {
         }
         return {};   // non-collection generic → custom
     }
+
+    if (t == "object" || t == "Object") return "any";
 
     switch (lang::map_type(t)) {
         case lang::CsTypeKind::String: return "string";
@@ -761,6 +844,12 @@ struct Converter {
         callbacks.push_back(std::move(name));
     }
 
+    // Root <Page>/<UserControl>/<Window> event attributes: the wrapper itself
+    // is transparent in .winui, so its events attach to the first element
+    // emitted into `body` (the view's real content root).
+    std::vector<std::string> root_event_mods;
+    std::string active_slot;
+
 
     // Record an x:Bind reference root; declare a state/binding var for it.
     // One-way bindings → @state var; two-way ($name) bindings → @binding var.
@@ -768,7 +857,7 @@ struct Converter {
     // "viewModelTitle") and code-behind types are carried through the winmd
     // ("List<string>" → "string[]", "DateTime" → "datetime").
     auto record_binding_root(std::string const& expr_in, std::string const& mode,
-                             std::string_view suffix_hint) -> void {
+                             std::string_view suffix_hint, std::string const& target_null = "") -> void {
         if (expr_in.empty()) return;
         // Pre-flatten root, for the code-behind type lookup (flattening renames
         // "viewModel.title" → "viewModelTitle", losing the original member).
@@ -785,9 +874,23 @@ struct Converter {
 
         bool two_way = (mode == "TwoWay");
         auto declare = [&](std::string type) {
-            if (two_way) ensure_binding_var(root, type);
-            else         ensure_state_var(root, type);
+            std::string init;
+            if (!target_null.empty()) init = qstr(target_null);
+            if (std::getenv("X2W_DEBUG") != nullptr) {
+                std::fprintf(stderr, "[x2w-bind] declare %s : %s (expr='%s' root='%s')\n",
+                    root.c_str(), type.c_str(), expr_in.c_str(), root.c_str());
+                std::fflush(stderr);
+            }
+            if (two_way) ensure_binding_var(root, type, init);
+            else         ensure_state_var(root, type, init);
         };
+        if (std::getenv("X2W_DEBUG") != nullptr) {
+            auto* dbg_m = find_cb_prop(orig_root);
+            std::fprintf(stderr, "[x2w-bind] root='%s' orig_root='%s' cb_match=%s%s\n",
+                root.c_str(), orig_root.c_str(), dbg_m ? "yes" : "NO",
+                dbg_m ? (std::string(" type=") + dbg_m->type).c_str() : "");
+            std::fflush(stderr);
+        }
 
         // if root matches a code-behind property → typed state/binding var
         if (auto* m = find_cb_prop(orig_root); m) {
@@ -798,8 +901,33 @@ struct Converter {
                 if (m->type.find("CollectionViewSource") != std::string::npos
                     && orig_dot != std::string::npos)
                     ty = "any[]";
-                else
-                    ty = winui_type(m->kind);   // custom → string fallback
+                else {
+                    // Flattened member of a custom class (item.IsExperimental →
+                    // itemIsExperimental): the declaring type lives in a model
+                    // file this code-behind doesn't parse, so its C# member type
+                    // is unknown here. Infer the common bool shape — PascalCase
+                    // Is*/Has*/Can* — so bool-typed setters (InfoBar.IsOpen,
+                    // IsEnabled…) receive a real bool instead of hstring
+                    // (C2665 downstream in the C++ projection).
+                    std::string last = expr_in;
+                    auto last_dot = expr_in.rfind('.');
+                    if (last_dot != std::string::npos) last = expr_in.substr(last_dot + 1);
+                    // Prefix match is case-insensitive (IsExperimental as well
+                    // as the pre-lower-camed isExperimental that arrives from
+                    // the flattener), but the char right after it must be
+                    // uppercase so "issue"/"island"-style names never match.
+                    auto ci_prefix_then_upper = [&](char const* pref) -> bool {
+                        std::size_t n = std::strlen(pref);
+                        if (last.size() <= n) return false;
+                        for (std::size_t k = 0; k < n; ++k)
+                            if (std::tolower(static_cast<unsigned char>(last[k])) != pref[k]) return false;
+                        return std::isupper(static_cast<unsigned char>(last[n]));
+                    };
+                    bool bool_shape = ci_prefix_then_upper("is")
+                        || ci_prefix_then_upper("has")
+                        || ci_prefix_then_upper("can");
+                    ty = bool_shape ? "bool" : winui_type(m->kind);
+                }
             }
             declare(ty);
             return;
@@ -985,6 +1113,25 @@ inline auto collect_codebehind_wiring(Converter& c, lang::CodeBehind const& cb) 
                     auto cc = qual.find_last_of(':');
                     handler = (cc == std::string::npos) ? qual : qual.substr(cc + 1);
                 }
+            } else if (ctor[h0] == '(') {
+                // C# lambda: += (s, e) => Handler(...); / += (s, e) => { Handler(); };
+                // Bound the scan to the current statement so `=>` can't run over.
+                std::size_t limit = ctor.find(';', h0);
+                if (limit == std::string::npos) limit = ctor.size();
+                std::size_t ar = h0;
+                while ((ar = ctor.find("=>", ar)) != std::string::npos && ar < limit) break;
+                if (ar != std::string::npos && ar < limit) {
+                    std::size_t k = ar + 2;
+                    while (k < limit) {
+                        while (k < limit && !(std::isalpha(static_cast<unsigned char>(ctor[k])) || ctor[k] == '_')) ++k;
+                        std::size_t id0 = k;
+                        while (k < limit && (std::isalnum(static_cast<unsigned char>(ctor[k])) || ctor[k] == '_')) ++k;
+                        if (k == id0) break;
+                        std::size_t j = k;
+                        while (j < limit && (ctor[j] == ' ' || ctor[j] == '\t')) ++j;
+                        if (j < limit && ctor[j] == '(') { handler = ctor.substr(id0, k - id0); break; }
+                    }
+                }
             } else {
                 std::size_t h1 = h0;
                 while (h1 < ctor.size() && (std::isalnum(static_cast<unsigned char>(ctor[h1])) || ctor[h1] == '_')) ++h1;
@@ -1105,22 +1252,41 @@ inline auto is_ignorable_attr(std::string_view name) -> bool {
 inline auto collect_fragment(xaml::Node const& el, std::vector<RawPair>& out) -> bool {
     bool prop_elem = (el.name.find('.') != std::string::npos);
     if (prop_elem) {
-        bool has_elem = false;
-        bool all_frag = true;
-        for (auto const& ch : el.children) {
-            if (ch.kind != xaml::NodeKind::Element) continue;
-            has_elem = true;
-            if (!is_frag_family(ch.name)) { all_frag = false; break; }
-        }
-        if (has_elem && all_frag) {
-            auto dot = el.name.find_last_of('.');
-            std::string key = el.name.substr(dot + 1);
+        auto dot = el.name.find_last_of('.');
+        std::string prop = el.name.substr(dot + 1);
+        if (prop == "Resources") {
             std::string frag;
             for (auto const& ch : el.children) {
                 if (ch.kind == xaml::NodeKind::Element) frag += serialize_fragment(ch);
             }
-            if (!frag.empty()) out.push_back({std::move(key), std::move(frag)});
+            if (!frag.empty()) out.push_back({"Resources", std::move(frag)});
             return true;
+        }
+        // Check if this property element is a standard container content collection
+        // that naturally unpacks into child controls in .winui syntax.
+        bool is_content_collection = (prop == "Children" || prop == "Items" || prop == "Child" ||
+                                      prop == "Content" || prop == "Inlines" || prop == "PrimaryCommands" ||
+                                      prop == "SecondaryCommands" || prop == "Commands" || prop == "Tabs" ||
+                                      prop == "Source" || prop == "MenuItems" || prop == "FooterMenuItems" ||
+                                      prop == "TabItems" || prop == "Icon" || prop == "Example" ||
+                                      prop == "Output" || prop == "Options");
+
+        if (!is_content_collection) {
+            // Future-proof & 3rd-party agnostic: serialize any property element's content
+            // (e.g. Flyout, HeaderIcon, Pane, PaneFooter, or custom properties) so the property
+            // association is preserved verbatim into raw attributes and metadata.
+            std::string frag;
+            for (auto const& ch : el.children) {
+                if (ch.kind == xaml::NodeKind::Element) frag += serialize_fragment(ch);
+                else if (ch.kind == xaml::NodeKind::CData) frag += "<![CDATA[" + ch.name + "]]>";
+            }
+            if (frag.empty() && !el.text.empty()) {
+                for (auto const& t : el.text) frag += t;
+            }
+            if (!frag.empty()) {
+                out.push_back({prop, std::move(frag)});
+                return true;
+            }
         }
         return false;
     }
@@ -1266,9 +1432,9 @@ inline auto map_element_name(Converter& c, xaml::Node const& el, bool& transpare
         note = name;
         return {};
     }
-    if (name == "Run") { note = "Run"; return "TextBlock"; }
+    if (name == "Run") return "Run";
     if (name == "FontIcon") return "FontIcon";
-    if (name == "LineBreak") { transparent = true; return {}; }
+    if (name == "LineBreak") return "LineBreak";
     if (name == "TextBlock") return "TextBlock";
     if (name == "StackPanel") return "StackPanel";
     if (name == "ScrollViewer") return "ScrollViewer";
@@ -1277,15 +1443,18 @@ inline auto map_element_name(Converter& c, xaml::Node const& el, bool& transpare
     if (name == "RelativePanel") return "RelativePanel";
     if (name == "VariableSizedWrapGrid") return "VariableSizedWrapGrid";
     if (name == "RichTextBlock") return "RichTextBlock";
-    if (name == "ContentPresenter") { transparent = true; return {}; }
+    if (name == "ContentPresenter") return "ContentPresenter";
     if (name == "ToolTip") return "ToolTip";
-    if (name == "NavigationViewItemSeparator") { transparent = true; return {}; }
+    if (name == "NavigationViewItemSeparator") return "NavigationViewItemSeparator";
     if (name == "AutoSuggestBox") return "AutoSuggestBox";
     if (name == "ContentDialog") return "ContentDialog";
     if (name == "TabViewItem") return "TabViewItem";
     if (name == "AppBarSeparator") return "AppBarSeparator";
-    if (name == "MenuFlyoutSeparator") { transparent = true; return {}; }
-    if (name == "AppBarElementContainer") { transparent = true; return {}; }
+    if (name == "MenuFlyoutSeparator") return "MenuFlyoutSeparator";
+    if (name == "AppBarElementContainer") return "AppBarElementContainer";
+    if (name == "BreadcrumbBarItem") return "BreadcrumbBarItem";
+    if (name == "TreeViewItem") return "TreeViewItem";
+    if (name == "ItemContainer") return "ItemContainer";
 
     if (is_registered(name)) return name;
 
@@ -1346,12 +1515,13 @@ inline auto emit_attributes(Converter& c, xaml::Node const& el, std::string cons
             if (!is_event) is_event = ext::is_ext_xaml_event(local);
             if (!is_event) is_event = ext::is_ext_ctrl_event(ctrl_name, local);
             if (is_event) {
-                if (is_ident(a.value)) {
+                std::string handler = event_handler_value(a.value);
+                if (!handler.empty()) {
                     std::string wev = xaml_event_to_winui(local);
                     // per-control extension events may rename the .winui event
                     if (auto xe = ext::ext_xaml_event(ctrl_name, local)) wev = *xe;
-                    c.ensure_callback(a.value);
-                    mods.push_back("." + wev + " { self." + a.value + "(); }");
+                    c.ensure_callback(handler);
+                    mods.push_back("." + wev + " { self." + handler + "(); }");
                 } else {
                     raws.push_back({aname, std::string(a.value)});
                 }
@@ -1372,7 +1542,7 @@ inline auto emit_attributes(Converter& c, xaml::Node const& el, std::string cons
                 std::string mode;
                 auto v = convert_value(a.value, local, comment, mode);
                 if (v.is_binding) {
-                    c.record_binding_root(v.expr, mode, local);
+                    c.record_binding_root(v.expr, mode, local, v.target_null);
                     std::string fexpr = c.flatten_cb_path(v.expr);
                     if (mode == "TwoWay") {
                         mods.push_back("." + std::string(m.winui) + "($" + fexpr + ")");
@@ -1597,7 +1767,7 @@ inline auto emit_attributes(Converter& c, xaml::Node const& el, std::string cons
             std::string mode;
             auto v = convert_value(a.value, local, comment, mode);
             if (v.is_binding) {
-                c.record_binding_root(v.expr, mode, local);
+                c.record_binding_root(v.expr, mode, local, v.target_null);
                 // two-way on input-ish properties → $ binding ref
                 std::string fexpr = c.flatten_cb_path(v.expr);
                 bool two_way = (mode == "TwoWay");
@@ -1614,6 +1784,13 @@ inline auto emit_attributes(Converter& c, xaml::Node const& el, std::string cons
             }
             // severity enum mapping: Informational→info etc.
             std::string val = v.expr;
+            if (v.is_resource_ref && winprop != "style" && winprop != "foregroundColor" && winprop != "backgroundColor") {
+                if (a.value.rfind("{StaticResource", 0) == 0 || a.value.rfind("{ThemeResource", 0) == 0) {
+                    val = qstr(a.value);
+                } else if (!v.resource_key.empty()) {
+                    val = qstr("{StaticResource " + v.resource_key + "}");
+                }
+            }
             if (winprop == "severity") {
                 std::string sv = a.value;
                 if (sv == "Informational") val = qstr("info");
@@ -2135,8 +2312,14 @@ inline auto convert_element(Converter& c, xaml::Node const& el) -> void {
 
     // property elements: Parent.Child — handled by parent
     if (ctrl.find('.') != std::string::npos) {
+        auto dot = ctrl.find_last_of('.');
+        std::string prop_slot = ctrl.substr(dot + 1);
         for (auto const& child : el.children) {
-            if (child.kind == xaml::NodeKind::Element) convert_element(c, child);
+            if (child.kind == xaml::NodeKind::Element) {
+                c.active_slot = prop_slot;
+                convert_element(c, child);
+                c.active_slot.clear();
+            }
         }
         return;
     }
@@ -2145,6 +2328,91 @@ inline auto convert_element(Converter& c, xaml::Node const& el) -> void {
     std::vector<std::string> mods;
     std::vector<RawPair> raws;
     emit_attributes(c, el, ctrl, args, mods, raws);
+    if (!c.active_slot.empty()) {
+        raws.push_back({"Slot", c.active_slot});
+        c.active_slot.clear();
+    }
+
+    if (ctrl == "ControlExample") {
+        if (auto sd = el.attr("SampleDefinition"); sd && !sd->empty()) {
+            std::string rel(*sd);
+            for (char& ch : rel) if (ch == '/') ch = '\\';
+            std::vector<std::string> scands;
+            if (c.opts && !c.opts->source_file_path.empty()) {
+                std::string cur = c.opts->source_file_path;
+                for (int up = 0; up < 5; ++up) {
+                    auto p = cur.find_last_of("\\/");
+                    if (p == std::string::npos) break;
+                    cur = cur.substr(0, p);
+                    scands.push_back(cur + "\\Samples\\" + rel);
+                    scands.push_back(cur + "\\WinUIGallery\\Samples\\" + rel);
+                }
+            }
+            scands.push_back("Samples\\" + rel);
+            scands.push_back("WinUIGallery\\Samples\\" + rel);
+            scands.push_back("..\\WinUIGallery\\Samples\\" + rel);
+            scands.push_back("..\\WinUI-Gallery\\WinUIGallery\\Samples\\" + rel);
+            std::string scontent;
+            for (auto const& sp : scands) {
+                FILE* fp = nullptr;
+#ifdef _WIN32
+                fopen_s(&fp, sp.c_str(), "rb");
+#else
+                fp = fopen(sp.c_str(), "rb");
+#endif
+                if (fp) {
+                    fseek(fp, 0, SEEK_END);
+                    long sz = ftell(fp);
+                    fseek(fp, 0, SEEK_SET);
+                    if (sz > 0) {
+                        scontent.resize(static_cast<size_t>(sz));
+                        fread(scontent.data(), 1, static_cast<size_t>(sz), fp);
+                    }
+                    fclose(fp);
+                    if (!scontent.empty()) break;
+                }
+            }
+            if (!scontent.empty()) {
+                std::string sec_header, sec_xaml, sec_cs, cur_sec;
+                std::string cur_buf;
+                auto flush_sec = [&]() {
+                    while (!cur_buf.empty() && (cur_buf.front() == '\r' || cur_buf.front() == '\n' || cur_buf.front() == ' ')) cur_buf.erase(cur_buf.begin());
+                    while (!cur_buf.empty() && (cur_buf.back() == '\r' || cur_buf.back() == '\n' || cur_buf.back() == ' ')) cur_buf.pop_back();
+                    if (cur_sec == "header") sec_header = cur_buf;
+                    else if (cur_sec == "xaml") sec_xaml = cur_buf;
+                    else if (cur_sec == "c#" || cur_sec == "csharp") sec_cs = cur_buf;
+                    cur_buf.clear();
+                };
+                std::size_t pos = 0;
+                while (pos < scontent.size()) {
+                    auto nl = scontent.find('\n', pos);
+                    std::string ln = scontent.substr(pos, (nl == std::string::npos) ? scontent.size() - pos : nl - pos);
+                    if (!ln.empty() && ln.back() == '\r') ln.pop_back();
+                    if (ln.rfind("--- ", 0) == 0) {
+                        flush_sec();
+                        cur_sec = ln.substr(4);
+                        while (!cur_sec.empty() && (cur_sec.back() == ' ' || cur_sec.back() == '\t')) cur_sec.pop_back();
+                        for (char& ch : cur_sec) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+                    } else {
+                        if (!cur_buf.empty()) cur_buf += '\n';
+                        cur_buf += ln;
+                    }
+                    if (nl == std::string::npos) break;
+                    pos = nl + 1;
+                }
+                flush_sec();
+                if (!sec_header.empty() && !el.has_attr("HeaderText")) {
+                    raws.push_back({"HeaderText", sec_header});
+                }
+                if (!sec_xaml.empty() && !el.has_attr("Xaml")) {
+                    raws.push_back({"Xaml", sec_xaml});
+                }
+                if (!sec_cs.empty() && !el.has_attr("CSharp")) {
+                    raws.push_back({"CSharp", sec_cs});
+                }
+            }
+        }
+    }
 
     std::string xname;
     for (auto const& a : el.attrs) {
@@ -2199,22 +2467,6 @@ inline auto convert_element(Converter& c, xaml::Node const& el) -> void {
                               || ctrl == "Paragraph" || ctrl == "Hyperlink" || ctrl == "Run"
                               || ctrl == "Span" || ctrl == "Bold" || ctrl == "Italic"
                               || ctrl == "Underline");
-    std::string text_content;
-    bool has_text = false;
-    for (auto const& t : el.text) {
-        if (!t.empty()) { has_text = true; text_content += t; }
-    }
-    if (has_text && args.find("text:") == std::string::npos) {
-        if (children_are_text) {
-            if (!args.empty()) args += ", ";
-            args += "text: " + qstr(text_content);
-        } else {
-            // registered control without text support: keep the content
-            // verbatim so nothing is ever lost
-            raws.push_back({"text", text_content});
-        }
-    }
-
     // If the parent also carries a live sample (X.Example), the Xaml string is
     // display-only — converting it too would duplicate the sample UI.
     bool has_live_example = false;
@@ -2254,6 +2506,78 @@ inline auto convert_element(Converter& c, xaml::Node const& el) -> void {
         real_children.push_back(&ch);
     }
 
+    bool is_doc_container = (ctrl == "Paragraph" || ctrl == "RichTextBlock" || ctrl == "Span");
+    std::vector<xaml::Node> inline_synth_nodes;
+    std::vector<xaml::Node const*> effective_children = real_children;
+
+    if (is_doc_container && !real_children.empty()) {
+        // Document container with inline children: synthesize Run nodes for mixed text
+        inline_synth_nodes.reserve(real_children.size() + el.text.size() + 2);
+        if (!el.text.empty() && !el.text[0].empty()) {
+            xaml::Node r0;
+            r0.kind = xaml::NodeKind::Element;
+            r0.name = "Run";
+            r0.attrs.push_back({"Text", el.text[0]});
+            inline_synth_nodes.push_back(std::move(r0));
+        }
+        for (auto const* ch : real_children) {
+            inline_synth_nodes.push_back(*ch);
+        }
+        for (std::size_t ti = 1; ti < el.text.size(); ++ti) {
+            if (!el.text[ti].empty()) {
+                xaml::Node rn;
+                rn.kind = xaml::NodeKind::Element;
+                rn.name = "Run";
+                rn.attrs.push_back({"Text", el.text[ti]});
+                inline_synth_nodes.push_back(std::move(rn));
+            }
+        }
+        // Ensure whitespace between adjacent inline runs
+        for (std::size_t i = 0; i + 1 < inline_synth_nodes.size(); ++i) {
+            auto& c1 = inline_synth_nodes[i];
+            auto& c2 = inline_synth_nodes[i + 1];
+            auto a1 = c1.attr("Text");
+            auto a2 = c2.attr("Text");
+            if (a1 && a2 && !a1->empty() && !a2->empty()) {
+                char b1 = a1->back();
+                char f2 = (*a2)[0];
+                bool ends_ws = (b1 == ' ' || b1 == '\t' || b1 == '\r' || b1 == '\n');
+                bool starts_ws = (f2 == ' ' || f2 == '\t' || f2 == '\r' || f2 == '\n');
+                bool starts_punct = (f2 == '.' || f2 == ',' || f2 == ';' || f2 == ':'
+                                     || f2 == '!' || f2 == '?' || f2 == ')' || f2 == ']' || f2 == '}');
+                if (!ends_ws && !starts_ws && !starts_punct) {
+                    bool c1_fmt = c1.has_attr("FontWeight") || c1.has_attr("FontFamily") || c1.has_attr("FontStyle");
+                    bool c2_fmt = c2.has_attr("FontWeight") || c2.has_attr("FontFamily") || c2.has_attr("FontStyle");
+                    if (!c1_fmt || c2_fmt) {
+                        for (auto& a : c1.attrs) {
+                            if (a.name == "Text" || a.name.ends_with(":Text")) { a.value += ' '; break; }
+                        }
+                    } else {
+                        for (auto& a : c2.attrs) {
+                            if (a.name == "Text" || a.name.ends_with(":Text")) { a.value = " " + a.value; break; }
+                        }
+                    }
+                }
+            }
+        }
+        effective_children.clear();
+        for (auto const& sn : inline_synth_nodes) effective_children.push_back(&sn);
+    } else {
+        std::string text_content;
+        bool has_text = false;
+        for (auto const& t : el.text) {
+            if (!t.empty()) { has_text = true; text_content += t; }
+        }
+        if (has_text && args.find("text:") == std::string::npos) {
+            if (children_are_text) {
+                if (!args.empty()) args += ", ";
+                args += "text: " + qstr(text_content);
+            } else {
+                raws.push_back({"text", text_content});
+            }
+        }
+    }
+
     // Inline DataTemplates (ItemTemplate/ContentTemplate/… holding <DataTemplate>
     // markup) are converted into structured JSON payloads so projections can emit
     // real item templates that render list items.
@@ -2272,6 +2596,14 @@ inline auto convert_element(Converter& c, xaml::Node const& el) -> void {
     for (auto& rp : c.pending_raw) mods.push_back(raw_mod(rp));
     c.pending_raw.clear();
     for (auto const& rp : raws) mods.push_back(raw_mod(rp));
+    // root wrapper events attach to the first real UI element (content root);
+    // non-visual helpers declared ahead of it (converters, behaviors) cannot
+    // host events like Loaded.
+    if (!c.root_event_mods.empty()
+        && !ctrl.ends_with("Converter") && !ctrl.ends_with("Behavior")) {
+        for (auto const& rm : c.root_event_mods) mods.push_back(rm);
+        c.root_event_mods.clear();
+    }
     for (auto const& m : mods) line += m;
     c.em.line(line);
 
@@ -2279,14 +2611,14 @@ inline auto convert_element(Converter& c, xaml::Node const& el) -> void {
     // Every element child is emitted as a children block — the .winui
     // compiler lowers children under any component (unknown ones only
     // produce a warning), so no XAML content is ever lost.
-    if (has_examples || !real_children.empty()) {
+    if (has_examples || !effective_children.empty()) {
         c.em.line("{");
         ++c.em.depth;
         if (has_examples) {
             c.em.line("// XAML code examples — converted to .winui equivalents");
             for (auto const& l : example_lines) c.em.line(l);
         }
-        for (auto const& ch : real_children) {
+        for (auto const& ch : effective_children) {
             convert_element(c, *ch);
         }
         --c.em.depth;
@@ -2926,6 +3258,17 @@ export inline auto convert(xaml::ParseResult const& doc, lang::CodeBehind const&
     c.result = &res;
 
     // index code-behind properties
+    {
+        bool dbg = std::getenv("X2W_DEBUG") != nullptr;
+        if (dbg) {
+            std::fprintf(stderr, "[x2w-cb] class=%s props=%zu found=%d\n",
+                codebehind.class_name.c_str(), codebehind.properties.size(), (int)codebehind.found);
+            for (auto const& m : codebehind.properties)
+                std::fprintf(stderr, "[x2w-cb]   prop '%s' : '%s' static=%d\n",
+                    m.name.c_str(), m.type.c_str(), (int)m.is_static);
+            std::fflush(stderr);
+        }
+    }
     for (auto const& m : codebehind.properties) {
         if (m.is_static) continue;
         if (!is_ident(m.name)) continue;
@@ -2976,24 +3319,30 @@ export inline auto convert(xaml::ParseResult const& doc, lang::CodeBehind const&
                 if (local == "Name" && prefix == "x") {
                     c.element_names[a.value] = n.name;
                 }
-                // find x:Bind references
-                if (a.value.size() > 2 && a.value.front() == '{' && a.value.back() == '}') {
-                    std::string inner = a.value.substr(1, a.value.size() - 2);
-                    if (inner.find("x:Bind") != std::string::npos || inner.rfind("Binding", 0) == 0) {
-                        std::string mode;
-                        std::string expr = translate_binding(inner, mode);
-                        if (!expr.empty()) c.record_binding_root(expr, mode, local);
-                    }
-                }
-                // event handlers (built-in + runtime JSON extensions)
+                // event handlers (built-in + runtime JSON extensions). Events
+                // win first so `{x:Bind Handler}` event values register the
+                // callback instead of a bogus binding root.
+                bool is_ev = false;
                 if (prefix.empty()) {
-                    bool is_ev = false;
                     for (auto const& ev : g_event_names) {
                         if (ev == local) { is_ev = true; break; }
                     }
                     if (!is_ev) is_ev = ext::is_ext_xaml_event(local);
                     if (!is_ev) is_ev = ext::is_ext_ctrl_event(n.name, local);
-                    if (is_ev && is_ident(a.value)) c.ensure_callback(a.value);
+                    if (is_ev) {
+                        std::string handler = event_handler_value(a.value);
+                        if (!handler.empty()) c.ensure_callback(handler);
+                    }
+                }
+                // find x:Bind references (non-event attributes only)
+                if (!is_ev && a.value.size() > 2 && a.value.front() == '{' && a.value.back() == '}') {
+                    std::string inner = a.value.substr(1, a.value.size() - 2);
+                    if (inner.find("x:Bind") != std::string::npos || inner.rfind("Binding", 0) == 0) {
+                        std::string mode;
+                        std::string target_null;
+                        std::string expr = translate_binding(inner, mode, &target_null);
+                        if (!expr.empty()) c.record_binding_root(expr, mode, local, target_null);
+                    }
                 }
             }
             for (auto const& ch : n.children) {
@@ -3046,20 +3395,116 @@ export inline auto convert(xaml::ParseResult const& doc, lang::CodeBehind const&
         em.blank();
     }
 
-    if (is_resource_dict) {
-        // Application root keeps its original name ("App"), not "AppResources"
-        std::string res_view = (root->name == "Application") ? view_name : (view_name + "Resources");
-        em.line("export view " + res_view + " {");
+    // Second view: a pure control class declared in code-behind whose XAML
+    // root is not the class itself (e.g. CopyButton.xaml is a
+    // ResourceDictionary). The control's visual tree lives in its Style's
+    // ControlTemplate — lower that template into the view body so the
+    // control actually renders instead of shipping an empty body.
+    auto emit_control_class_view = [&]() -> void {
+        std::string cls = codebehind.class_name;
+        auto cpos = cls.find(':');
+        if (cpos != std::string::npos) cls = cls.substr(cpos + 1);
+        while (!cls.empty() && (cls.front() == ' ' || cls.front() == '\t')) cls.erase(cls.begin());
+        while (!cls.empty() && (cls.back() == ' ' || cls.back() == '\t')) cls.pop_back();
+        if (cls.empty() || cls == view_name) return;
+        std::string base = codebehind.base_class.empty() ? "Control" : codebehind.base_class;
+
+        // Find <Style TargetType="…:Cls"> … <ControlTemplate> … in document
+        // order; keep searching past matching styles that carry no template
+        // (CopyButton's implicit BasedOn style comes first).
+        xaml::Node const* tmpl = nullptr;
+        {
+            std::vector<xaml::Node const*> stack;
+            for (auto it = root->children.rbegin(); it != root->children.rend(); ++it)
+                if (it->kind == xaml::NodeKind::Element) stack.push_back(&*it);
+            while (!stack.empty() && !tmpl) {
+                auto* n = stack.back();
+                stack.pop_back();
+                if (n->kind == xaml::NodeKind::Element && n->name == "Style") {
+                    auto tt = n->attr("TargetType");
+                    if (tt) {
+                        std::string t(*tt);
+                        auto col = t.find_last_of(':');
+                        std::string loc = (col == std::string::npos) ? t : t.substr(col + 1);
+                        if (loc == cls) {
+                            std::vector<xaml::Node const*> st2{n};
+                            while (!st2.empty() && !tmpl) {
+                                auto* m = st2.back();
+                                st2.pop_back();
+                                if (m->kind == xaml::NodeKind::Element && m->name == "ControlTemplate") { tmpl = m; break; }
+                                for (auto it2 = m->children.rbegin(); it2 != m->children.rend(); ++it2)
+                                    if (it2->kind == xaml::NodeKind::Element) st2.push_back(&*it2);
+                            }
+                        }
+                    }
+                }
+                if (n->kind == xaml::NodeKind::Element)
+                    for (auto it2 = n->children.rbegin(); it2 != n->children.rend(); ++it2)
+                        if (it2->kind == xaml::NodeKind::Element) stack.push_back(&*it2);
+            }
+        }
+
+        em.blank();
+        em.line("export view " + cls + " : " + base + " {");
         ++em.depth;
+        for (auto const& p : codebehind.properties)
+            em.line("@state var " + p.name + ": " + sanitize_winui_type(p.type) + ";");
+        for (auto const& cb : c.callbacks)
+            emit_callback_decl(em, codebehind, c, cb);
+        for (auto const& ev : codebehind.events) {
+            bool dup = false;
+            for (auto const& cb : c.callbacks) if (cb == ev) { dup = true; break; }
+            if (!dup) em.line("callback " + ev + "();");
+        }
         em.line("body {");
         ++em.depth;
-        for (auto const& r : root->children) {
-            if (r.kind == xaml::NodeKind::Element) emit_resource_entries(c, r);
+        if (tmpl) {
+            for (auto const& ch : tmpl->children)
+                if (ch.kind == xaml::NodeKind::Element) convert_element(c, ch);
         }
         --em.depth;
         em.line("}");
         --em.depth;
         em.line("}");
+    };
+
+    if (is_resource_dict) {
+        // Application root keeps its original name ("App"), not "AppResources"
+        std::string res_view;
+        if (root->name == "Application") {
+            res_view = view_name;
+        } else {
+            res_view = view_name + "Resources";
+            // Files without x:Class fall back to the root element name
+            // ("ResourceDictionary") — every such file would collide as
+            // ResourceDictionaryResources and only one of them survives into
+            // the winmd, so name them from the source file stem instead.
+            if (view_name == root->name && !opts.source_file_path.empty()) {
+                std::string stem = opts.source_file_path;
+                auto slash = stem.find_last_of("/\\");
+                if (slash != std::string::npos) stem = stem.substr(slash + 1);
+                auto dot = stem.find_last_of('.');
+                if (dot != std::string::npos) stem = stem.substr(0, dot);
+                if (!stem.empty() && is_ident(stem)) res_view = stem + "Resources";
+            }
+        }
+        em.line("export view " + res_view + " {");
+        ++em.depth;
+        em.line("body {");
+        ++em.depth;
+        for (auto const& r : root->children) {
+            if (r.kind != xaml::NodeKind::Element) continue;
+            if (r.name.find('.') != std::string::npos || r.name == "ThemeDictionaries") {
+                emit_resource_entries(c, r);
+            } else {
+                c.em.line("Raw() " + raw_mod({"Resource", serialize_fragment(r)}));
+            }
+        }
+        --em.depth;
+        em.line("}");
+        --em.depth;
+        em.line("}");
+        if (opts.emit_control_view) emit_control_class_view();
         res.text = std::move(em.out);
         return res;
     }
@@ -3094,6 +3539,15 @@ export inline auto convert(xaml::ParseResult const& doc, lang::CodeBehind const&
         }
         return decl;
     };
+    if (root->name == "UserControl") {
+        for (auto const& p : codebehind.properties) {
+            if (p.is_static || !is_ident(p.name)) continue;
+            std::string lc = lower_camel(p.name);
+            if (!c.state_set.count(lc) && !c.state_set.count(p.name)) {
+                c.ensure_state_var(lc, sanitize_winui_type(p.type));
+            }
+        }
+    }
     for (auto const& v : c.state_vars) {
         em.line("@state var " + retype_element_state(v) + ";");
     }
@@ -3117,6 +3571,36 @@ export inline auto convert(xaml::ParseResult const& doc, lang::CodeBehind const&
     em.line("body {");
     ++em.depth;
 
+    // Root wrapper event attributes (<Page>/<UserControl>/<Window>): the
+    // wrapper is transparent, so wire its events onto the first element
+    // emitted into the body — the view's real content root.
+    if (!is_resource_dict) {
+        for (auto const& a : root->attrs) {
+            if (a.name.find(':') != std::string::npos) continue; // prefixed: plumbing
+            if (a.name.rfind("xmlns", 0) == 0) continue;
+            bool is_ev = false;
+            for (auto const& ev : g_event_names) if (ev == a.name) { is_ev = true; break; }
+            if (!is_ev) is_ev = ext::is_ext_xaml_event(a.name);
+            if (!is_ev) is_ev = ext::is_ext_ctrl_event(root->name, a.name);
+            if (!is_ev) {
+                std::string lan = a.name;
+                for (auto& cch : lan) cch = static_cast<char>(std::tolower(static_cast<unsigned char>(cch)));
+                if (lan == "width" || lan == "height" || lan == "minwidth" || lan == "minheight"
+                    || lan == "maxwidth" || lan == "maxheight" || lan == "margin" || lan == "padding"
+                    || lan == "horizontalalignment" || lan == "verticalalignment") {
+                    c.pending_raw.push_back({a.name, std::string(a.value)});
+                }
+                continue;
+            }
+            std::string handler = event_handler_value(a.value);
+            if (handler.empty()) continue;
+            std::string wev = xaml_event_to_winui(a.name);
+            if (auto xe = ext::ext_xaml_event(root->name, a.name)) wev = *xe;
+            c.ensure_callback(handler);
+            c.root_event_mods.push_back("." + wev + " { self." + handler + "(); }");
+        }
+    }
+
     // root element conversion (transparent for Page/UserControl/Window)
     for (auto const& r : root->children) {
         if (r.kind == xaml::NodeKind::Element) convert_element(c, r);
@@ -3127,6 +3611,8 @@ export inline auto convert(xaml::ParseResult const& doc, lang::CodeBehind const&
     em.line("}");
     --em.depth;
     em.line("}");
+
+    if (opts.emit_control_view) emit_control_class_view();
 
     res.text = std::move(em.out);
     return res;

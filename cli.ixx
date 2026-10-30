@@ -127,6 +127,10 @@ inline auto print_help(char const* prog) -> void {
     std::println("                           auto-loaded as a control registry too");
     std::println("  -h, -help                 show this help");
     std::println("");
+    std::println("ASSETS & LICENSE:");
+    std::println("  Referenced assets and any LICENSE file found in the input root are");
+    std::println("  automatically copied to the output directory.");
+    std::println("");
     std::println("A *.json control registry next to xaml2winuic.exe is auto-loaded (third-party");
     std::println("");
     std::println("EXAMPLES:");
@@ -402,7 +406,10 @@ inline auto resolve_code_behind(std::filesystem::path const& xaml, std::string c
                 }
             }
             auto src = load_text_file(cand);
-            auto cb = lang::parse_csharp(src);
+            // Pass the XAML file stem: the .cs may declare helper classes
+            // before the view class, and the view's own class is the one
+            // whose members the bindings must resolve against.
+            auto cb = lang::parse_csharp(src, xaml.stem().string());
             if (forced_lang != "cpp") return {std::move(cb), "csharp"};
         }
     }
@@ -568,6 +575,19 @@ inline auto run_job(XamlJob const& j, CliOptions const& o) -> JobResult {
     copts.language = j.language;
     copts.source_file_path = j.xaml_path.string();
 
+    // Pure C#/C++ control classes: when the code-behind declares a control
+    // base (Button, Control, ...) but the XAML root is NOT the class itself
+    // (e.g. CopyButton.xaml is a ResourceDictionary), a second view for the
+    // class must be emitted so the winmd declares the control with its real
+    // base. convert() does the emission — it owns the element walker needed
+    // to lower the control's ControlTemplate into the view body.
+    auto const& cbd = j.codebehind;
+    bool standard_view_base = (cbd.base_class == "Page" || cbd.base_class == "Window"
+        || cbd.base_class == "Application" || cbd.base_class == "UserControl"
+        || cbd.base_class == "ContentDialog" || cbd.base_class == "DataTemplateSelector"
+        || cbd.base_class.empty());
+    copts.emit_control_view = (cbd.found && !standard_view_base && !cbd.class_name.empty());
+
     auto res = convert::convert(doc, j.codebehind, copts);
     r.warnings = std::move(res.warnings);
     r.errors = std::move(res.errors);
@@ -576,35 +596,7 @@ inline auto run_job(XamlJob const& j, CliOptions const& o) -> JobResult {
     if (r.errors.empty()) {
         r.success = true;
         r.text = std::move(res.text);
-
-        // Pure C#/C++ control classes: when the code-behind declares a control
-        // base (Button, ContentControl, ...) but the XAML root is NOT the class
-        // itself (e.g. CopyButton.xaml is a ResourceDictionary), emit a second
-        // view for the class so the winmd declares the control with its real
-        // base. Consumers then resolve events like Click through the base.
-        auto const& cbd = j.codebehind;
-        bool standard_view_base = (cbd.base_class == "Page" || cbd.base_class == "Window"
-            || cbd.base_class == "Application" || cbd.base_class == "UserControl"
-            || cbd.base_class == "ContentDialog" || cbd.base_class == "DataTemplateSelector"
-            || cbd.base_class.empty());
-        if (cbd.found && !standard_view_base && !cbd.class_name.empty()
-            && res.view_name != cbd.class_name) {
-            std::string cls = cbd.class_name;
-            if (cls.find(':') != std::string::npos) cls = cls.substr(cls.rfind(':') + 1);
-            r.text += "\n";
-            r.text += "export view " + cls + " : " + cbd.base_class + " {\n";
-            // Types must come from the .winui vocabulary. Raw C# annotations
-            // ("object?", "Button?", "TypedEventHandler<A, B>?", generics)
-            // are illegal in .winui and made winuic fail with "expected
-            // identifier, got '?'" — sanitize them.
-            for (auto const& p : cbd.properties)
-                r.text += "    @state var " + p.name + ": "
-                        + convert::sanitize_winui_type(p.type) + ";\n";
-            for (auto const& ev : cbd.events)
-                r.text += "    callback " + ev + "();\n";
-            r.text += "    body {\n    }\n}\n";
-            r.is_resource = false;
-        }
+        if (copts.emit_control_view && res.view_name != cbd.class_name) r.is_resource = false;
     }
     return r;
 }
@@ -780,6 +772,7 @@ export inline auto run(int argc, char** argv) -> int {
         for (auto const& in_path : opts->inputs) {
             std::filesystem::path p(in_path);
             if (is_file(p)) p = p.parent_path();
+            add_src_root(p.wstring());
             std::wstring dir = p.wstring();
             for (int d = 0; d < 10 && !dir.empty(); ++d) {
                 // Check this directory for Assets/
@@ -818,6 +811,16 @@ export inline auto run(int argc, char** argv) -> int {
                 std::filesystem::copy_file(asset_file, dest,
                     std::filesystem::copy_options::overwrite_existing, cec);
                 if (!cec) ++assets_copied;
+            }
+        }
+        // Copy LICENSE file to output directory if present
+        for (auto const& rs : src_roots) {
+            auto lic = std::filesystem::path(rs) / "LICENSE";
+            if (file_exists(lic)) {
+                std::error_code lec;
+                std::filesystem::copy_file(lic, std::filesystem::path(out_dir) / "LICENSE",
+                    std::filesystem::copy_options::overwrite_existing, lec);
+                break;
             }
         }
     }

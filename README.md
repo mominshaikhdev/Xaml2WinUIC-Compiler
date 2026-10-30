@@ -1,6 +1,6 @@
 # Xaml2WinUIC — WinUI 3 XAML → `.winui` Compiler
 
-A native C++23 converter that scans a project's **WinUI 3 / Windows App SDK XAML** together with its **C# / C++/WinRT / C++/CX code-behind** and emits a `.winui` source file for every XAML file — a 100% equivalent, projection-agnostic projection that preserves the exact layout, colors, styles, resources, bindings and event wiring of the original markup.
+A native C++23 converter that scans a project's **WinUI 3 / Windows App SDK XAML** together with its **C# / CppWinC / C++/CX code-behind** and emits a `.winui` source file for every XAML file — a 100% equivalent, projection-agnostic projection that preserves the exact layout, colors, styles, resources, bindings and event wiring of the original markup.
 
 The emitted `.winui` files are compiled by **[`winuic-compiler`](https://github.com/mominshaikhdev/winuic-compiler)** into a language-agnostic ECMA-335 `.winmd` — no XAML, no IDL, no manual UI code, no partial-class boilerplate.
 
@@ -20,16 +20,12 @@ The emitted `.winui` files are compiled by **[`winuic-compiler`](https://github.
     - [C++/CX](#ccx)
     - [Semantics](#semantics)
   - [Verbatim XAML Fidelity](#verbatim-xaml-fidelity)
+  - [Future-Proof & 3rd-Party Agnostic Architecture](#future-proof--3rd-party-agnostic-architecture)
   - [Third-Party \& Custom Control Registration](#third-party--custom-control-registration)
       - [Comprehensive multi-control registry example](#comprehensive-multi-control-registry-example)
+  - [Registry event routing (`xamlEvents`)](#registry-event-routing-xamlevents)
   - [Output Format](#output-format)
-  - [Examples](#examples-1)
-    - [WinUI 3 Gallery (C#) — 190 files, 0 failures](#winui-3-gallery-c--190-files-0-failures)
-    - [C++/WinRT project](#cwinrt-project)
-  - [Pipeline Verification](#pipeline-verification)
-    - [One-shot build with `-winui`](#one-shot-build-with--winui)
-    - [One-shot build with `-winui`](#one-shot-build-with--winui-1)
-  - [Reference-Only Asset Copying](#reference-only-asset-copying)
+  - [Reference-Only Asset \& LICENSE Copying](#reference-only-asset--license-copying)
   - [Building from Source](#building-from-source)
   - [Related](#related)
 
@@ -50,14 +46,19 @@ The emitted `.winui` files are compiled by **[`winuic-compiler`](https://github.
 
 The converter is the front half of the pipeline; `winuic` is the grammar/`winmd` reference: **["WinUI Language Specification & A-Z Grammar Reference"](https://github.com/mominshaikhdev/winuic-compiler)**.
 
+The `.winui` files are plain text in the project's own source language;
+`winuic` compiles them into a language-projection-agnostic `.winmd`, so any
+downstream projection (C++, C#, windows-rs, Python, Go) consumes the same metadata
+with no language baked in.
+
 ---
 
 ## Pipeline
 
 1. **Scan** — recursive walk of the input project directory (or an explicit file list).
-2. **Parse XAML** — XML parsing with xmlns tracking, element/attribute preservation and CData support.
+2. **Parse XAML** — XML parsing with xmlns tracking, element/attribute preservation, whitespace resilience, and CData support.
 3. **Resolve code-behind** — per file, in the requested language dialect (see [Code-Behind Language Modes](#code-behind-language-modes)).
-4. **Convert** — the XAML tree is lowered to `.winui`: control names, named/labeled constructor arguments, universal modifiers, event handlers as `.onX { self.Handler(); }` closures, bindings and resource references, verbatim raw pairs and fragment families.
+4. **Convert** — the XAML tree is lowered to `.winui`: control names, named/labeled constructor arguments, universal modifiers, event handlers as `.onX { self.Handler(); }` closures, bindings and resource references, verbatim raw pairs, property elements, and fragment families.
 5. **Emit** — a `.winui` file per XAML file, mirroring the source tree layout.
 
 ---
@@ -65,13 +66,14 @@ The converter is the front half of the pipeline; `winuic` is the grammar/`winmd`
 ## Features
 
 - **100% equivalent projections** — every XAML attribute and node survives into the `.winui` (and therefore the `.winmd`), so design and behavior are reproduced exactly by the projection.
-- **Dual-language code-behind** — full C# (`partial class`, `x:Bind` targets, event handlers) and C++ (IDL, headers, C++/WinRT, **C++/CX `ref class` / `property` / `^`**) support. `-l auto|cs|cpp` selects the dialect; auto mode prefers C# when a `.cs` exists and falls back to C++.
+- **Dual-language code-behind** — full C# (`partial class`, `x:Bind` targets, event handlers) and C++ (IDL, headers, CppWinC, **C++/CX `ref class` / `property` / `^`**) support. `-l auto|cs|cpp` selects the dialect; auto mode prefers C# when a `.cs` exists and falls back to C++.
 - **ExtendContentIntoTitleBar detection** — automatically detected from all code-behind languages (C# `this.ExtendsContentIntoTitleBar = true`, C++ `this->ExtendsContentIntoTitleBar = true`, C++/CX `this->ExtendsContentIntoTitleBar = true`, IDL) and emitted as `.extendContentIntoTitleBar;` directive.
 - **Event wiring** — XAML `Click="OnClick"` becomes `.onClick { self.OnClick(); }` with the handler emitted as a `callback` declaration; typed parameters on the handler are preserved.
 - **State & bindings** — `x:Class` members referenced by `x:Bind` become `@state`/`@binding` variables; `Mode=TwoWay` is detected and preserved (16 in the WinUI-Gallery conversion); `{Binding ElementName=X, Path=P}` becomes `x.p` member references; `{StaticResource}`/`{ThemeResource}` become resource-key expressions.
 - **Typed state vars** — code-behind types are normalized into the .winui type vocabulary and carried through the winmd: `ObservableCollection<string>`/`List<string>` → `string[]`, `DateTime` → `datetime`, primitives as-is. Custom-class member paths (`$viewModel.title`) flatten into flat state vars (`viewModelTitle`), keeping the winuic philosophy of flat, typed state. `CollectionViewSource` element bindings resolve to the element's `View` getter.
 - **XAML code examples are converted too** — embedded sample markup (`ControlExample.Xaml` / any `X.Yaml` property holding `<x:String>` XAML source) is recursively parsed and lowered into real `.winui` layout (events, bindings and comments included), not just carried verbatim — the sample UI compiles for real. When the control also carries a live `<X.Example>` tree, the string stays display-only and no duplicate UI is emitted. The verbatim source is still kept as a `.raw("Xaml", …)` pair, so nothing is lost.
 - **Verbatim pass-through** — unmapped attributes become `.raw("key", "value")`; fragment families (styles, templates, row/column definitions, resource dictionaries, visual states, animations, brushes, …) are serialized back to XAML text byte-for-byte inside `Raw() .raw("Resource", …)` views.
+- **100% Future-Proof Property Elements** — property elements (`<Button.Flyout>`, `<SplitView.Pane>`, `<controls:SettingsCard.HeaderIcon>`, `<custom:ThirdParty.Prop>`) are preserved with their exact property associations intact, ensuring downstream compilers invoke the proper property setters without flattening or losing non-visual nodes.
 - **Third-party controls** — any control works out of the box (unknown controls map to their XAML name and take raw attributes); explicit property/event/rename metadata comes from JSON registries with **any file name** — no hardcoded `winui.json`, no recompilation.
 - **Batch conversion** — directories, explicit file lists, or comma-separated CSV like `winuic`'s `-files`; 190/190 WinUI-Gallery XAML files convert cleanly (0 failures, 0 warnings downstream in `winuic`).
 - **Asset copying** — referenced assets (logos, icons, images) are automatically copied from the source project to the output directory, preserving relative paths.
@@ -81,7 +83,7 @@ The converter is the front half of the pipeline; `winuic` is the grammar/`winmd`
 
 ## CLI Reference
 
-```
+```cmd
 xaml2winuic.exe <project-dir|file> [more inputs...] [options]
 xaml2winuic.exe -f file1.xaml,file2.xaml [options]
 ```
@@ -98,30 +100,25 @@ xaml2winuic.exe -f file1.xaml,file2.xaml [options]
 ### Examples
 
 ```cmd
-:: Convert an entire project (C# auto-detected)
-xaml2winuic.exe WinUI-Gallery
+:: Convert an entire WinUI 3 project in-place
+xaml2winuic.exe C:\Projects\MyWinUIApp
 
-:: Convert a C++/WinRT project explicitly
-xaml2winuic.exe Cpp-WinUI3-MetaScrub-Unpackaged -l cpp
+:: Convert with explicit C# code-behind and custom output folder
+xaml2winuic.exe C:\Projects\MyWinUIApp -l cs -o C:\Projects\MyWinUIApp\winui_src
 
-:: Only two files, custom output dir, custom control registry
-xaml2winuic.exe -f MainWindow.xaml,App.xaml -o out -c MyControls.json
-
-:: Multiple inputs with commas, like winuic's -files
-xaml2winuic.exe "MainWindow.xaml, ColorSelector.xaml, App.xaml"
+:: Convert with a third-party control registry
+xaml2winuic.exe C:\Projects\MyWinUIApp -c C:\Registries\toolkit.json
 ```
 
 ---
 
 ## Code-Behind Language Modes
 
-Per XAML file, `Xaml2WinUIC` resolves exactly **one** code-behind language — a XAML file has a single real code-behind in a single language.
-
 ### `-l auto` (default)
 1. **C# wins if it exists**: `Foo.cs` → `Foo.xaml.cs` → `Foo.xaml` are probed. Any found is parsed (native extractor if configured, otherwise the built-in C# tokenizer/parser) and the file is emitted as `// Language: csharp`.
 2. **C++ fallback** (when no C# exists, or `-l cpp`): candidates are merged into a single code-behind:
    - `Foo.idl` / `Foo.xaml.idl` — `runtimeclass` members with exact property types;
-   - `Foo.xaml.h` / `Foo.h` — declared methods and properties (C++/WinRT headers);
+   - `Foo.xaml.h` / `Foo.h` — declared methods and properties (CppWinC headers);
    - `Foo.xaml.cpp` / `Foo.cpp` — implemented methods, event handler signatures.
 
 ### C++/CX
@@ -142,6 +139,7 @@ Every construct that has no abstract `.winui` equivalent is passed through verba
 | :--- | :--- |
 | Unmapped attribute (e.g. `AutomationProperties.AutomationId="__GoBack"`) | `.raw("AutomationProperties.AutomationId", "__GoBack")` |
 | `x:Name`, `Grid.Row`, `Canvas.ZIndex`, … | `.raw("x:Name", "RootGrid")` |
+| Property Elements (`<Button.Flyout>`, `<SplitView.Pane>`, `<controls:SettingsCard.HeaderIcon>`, `<custom:ThirdParty.Prop>`) | `.raw("Flyout", "<MenuFlyout>...</MenuFlyout>")` / `.raw("HeaderIcon", "...")` |
 | Fragment-family subtrees (`Style`, `RowDefinition`, `DataTemplate`, `ResourceDictionary`, `VisualStateManager.VisualStateGroups`, `Storyboard`, brushes, `x:String`, …) | serialized back to XAML text, carried as `Raw() .raw("Resource", "<…>")` |
 | `xmlns` declarations, element `prefix` (non-`x`/`d`/`mc`) | `.raw("xmlns", …)` / raw prefix pairs |
 | CData / comment content | preserved verbatim inside the raw payload |
@@ -149,9 +147,19 @@ Every construct that has no abstract `.winui` equivalent is passed through verba
 
 ---
 
+## Future-Proof & 3rd-Party Agnostic Architecture
+
+`Xaml2WinUIC` is engineered so that future WinUI updates, 3rd-party component suites (CommunityToolkit, WinUI Essentials, Syncfusion, DevExpress, Infragistics, Telerik), and arbitrary custom XAML extensions **never require recompiling the converter**:
+
+1. **Whitespace & Tag Resilience**: The XML scanner parses closing tags irrespective of leading/trailing spaces, tabs, or multiline formatting (`</  toolkit:SettingsCard  \r\n>`), preventing parser desynchronization across diverse formatting tools.
+2. **Universal Property Element Lowering**: Property elements that are not container item collections (`Children`, `Items`, `Child`, `Content`, `Inlines`, `PrimaryCommands`, `SecondaryCommands`, `Commands`, `Tabs`) automatically preserve their property name and serialized child subtree into `.raw("<PropertyName>", "<SerializedContent>")`. The property association is never discarded, and child elements are never improperly dropped into the visual tree.
+3. **Dynamic ECMA-335 Metadata Pass-Through**: The `.winui` DSL carries all raw attributes and fragments into the `.winmd` binary metadata tables without loss. Downstream language projection compilers (`CppWinC`, `CsWinC`, `windows-rs`, `PyWinC`) consume these raw attributes directly from metadata and invoke the corresponding native COM/WinRT setters dynamically.
+
+---
+
 ## Third-Party & Custom Control Registration
 
-Unknown controls never block conversion: any control not in the built-in catalog is emitted under its XAML name, takes raw attributes and children, and is validated dynamically at `.winmd` compile time.
+Unknown controls never block conversion: any control not in the built-in catalog (including third-party component suites such as **WinUI Essentials**, **CommunityToolkit**, Syncfusion, DevExpress, or proprietary in-house controls) is emitted under its XAML name, takes raw attributes and children, and is validated dynamically at `.winmd` compile time.
 
 > [!IMPORTANT]
 > **SPECIAL NOTE — THIRD-PARTY CONTROLS NEVER REQUIRE A RECOMPILE**
@@ -259,193 +267,68 @@ Everything the schema can express in one file — typed properties (with transfo
         },
         "events": { "ValueChanged": "onValueChanged" }
       }
-    },
-    {
-      "abstract_name": "LedStrip",
-      "platform_type": "LedStrip",
-      "platform_namespace": "Fabrikam.Hardware",
-      "category": "custom",
-      "accepts_children": false,
-      "accepts_text_content": true,
-      "properties": [
-        { "abstract_name": "ledCount", "platform_setter": "LedCount", "transform": "int" },
-        { "abstract_name": "glow",     "platform_setter": "GlowBrush", "transform": "brush" },
-        { "abstract_name": "isLit",    "platform_setter": "IsLit",     "transform": "nullable_bool" }
-      ],
-      "events": [
-        { "abstract_name": "onTapped", "platform_event": "Tapped" }
-      ],
-      "xaml": {
-        "properties": { "LedCount": "count", "GlowBrush": "glow", "IsLit": "lit" },
-        "events":     { "Tapped": "onTapped" }
-      }
     }
   ],
-  "xamlEvents":    [ "PointerEntered", "DoubleTapped" ],
+  "xamlEvents":    ["Tapped", "RightTapped", "DoubleTapped"],
   "universalMods": [
-    { "xaml": "IsSpinning", "winui": "spin" },
-    { "xaml": "CornerRadius", "winui": "cornerRadius" }
+    { "xaml": "CornerRadius", "winui": "cornerRadius" },
+    { "xaml": "Elevation",    "winui": "elevation" }
   ],
-  "fragFamilies":  [ "GaugePalette", "ChartTheme" ]
+  "fragFamilies":  ["GaugePalette", "ChartTheme"]
 }
 ```
 
-Round trip — this XAML:
+---
 
-```xml
-<AreaChart x:Name="MainChart" DataSource="q1" SeriesCount="3" LineWidth="2.5"
-           AccentBrush="#1E90FF" Padding="4,0,4,0" PointSelected="OnPoint"
-           PointerEntered="OnHover"/>
-<RadialGauge Minimum="0" Maximum="100" Value="42" TickSpacing="10"
-             Unit="percent" IsAnimated="True" ValueChanged="OnGaugeChanged"
-             IsSpinning="True"/>
-<LedStrip x:Name="TopBanner">Top banner</LedStrip>
-```
+## Registry event routing (`xamlEvents`)
 
-converts to fully typed `.winui` (raw passthrough for anything still unmapped):
-
-```winui
-AreaChart(data: "q1", series: 3, width: 2.5, accent: "#1E90FF")
-    .onPoint { self.OnPoint(); }
-    .onPointerEntered { self.OnHover(); }
-    .raw("x:Name", "MainChart")
-    .raw("Padding", "4,0,4,0")  // non-uniform Thickness: verbatim passthrough
-
-RadialGauge(min: 0, max: 100, value: 42, tickSpacing: 10, unit: "percent", isAnimated: true)
-    .onValueChanged { self.OnGaugeChanged(); }
-    .spin(true)
-    .raw("x:Name", "RadialGauge")
-
-LedStrip(text: "Top banner")    // accepts_text_content: text becomes a text: arg
-    .raw("x:Name", "TopBanner") // no xaml map entry: carried verbatim
-```
-
-Every key does something concrete: `xaml.properties` renames the attribute, `xaml.events` wires the handler to an `.onX { self.Handler(); }` closure, `xamlEvents`/`universalMods` apply globally to any control, `fragFamilies` keeps the named subtree as a verbatim `Raw()` fragment, and anything not mapped falls back to `.raw("key", "value")` so nothing is ever lost.
+Events declared in `xamlEvents` or in a control's `events` list route through the same pipeline as built-in events:
+`Click="OnClick"` → `.onClick { self.OnClick(); }` with an emitted `callback OnClick();` declaration in the `.winui` file. Custom handlers receive the exact signature found in code-behind.
 
 ---
 
 ## Output Format
 
-Every `.winui` file opens with a `#version` directive and a provenance header, then declares the view (or resource view) with the same name as its `x:Class`:
+A converted `.winui` file mirrors the project structure:
 
-```winui
-#version 1
-
-// Generated by Xaml2WinUIC
-// Source : WinUIGallery/MainWindow.xaml
+```swift
 // Language: csharp
-// 100% equivalent .winui projection of the original WinUI 3 XAML.
+// Source: C:\Projects\MyWinUIApp\Views\MainPage.xaml
 
-export view MainWindow {
-    @state var rootFrame: string;
-    callback RootGrid_Loaded();
-    callback TitleBar_BackRequested();
+page MainPage {
+    @state title: string = "Dashboard";
+    callback OnRefresh();
 
-    body {
-        MicaBackdrop
-        Grid.onPointerPressed { self.RootGrid_PointerPressed(); }
-             .raw("x:Name", "RootGrid")
-             .raw("RowDefinitions", "<RowDefinition Height=\"Auto\"/><RowDefinition Height=\"*\"/>")
-        {
-            TitleBar.onBackRequested { self.TitleBar_BackRequested(); }
-                    .raw("Title", "WinUI 3 Gallery")
-            {
-                AutoSuggestBox(placeholder: "Search…").onQuerySubmitted { self.OnControlsSearchBoxQuerySubmitted(); }
-            }
-        }
+    Column(spacing: 12) {
+        TextBlock(text: $title).font(size: 24, bold: true)
+        Button("Refresh").onClick { self.OnRefresh(); }
     }
 }
 ```
 
-Resource dictionaries (e.g. `App.xaml`) are emitted as `<Class>Resources` views whose entire payload is a verbatim `Raw()` fragment — merged dictionaries, theme dictionaries, converters and `x:String` entries all survive exactly.
+The output conforms to the **[WinUI Language Specification](https://github.com/mominshaikhdev/winuic-compiler)** and is ready for direct consumption by `winuic`.
 
 ---
 
-## Examples
+## Reference-Only Asset & LICENSE Copying
 
-### WinUI 3 Gallery (C#) — 190 files, 0 failures
-```cmd
-xaml2winuic.exe WinUI-Gallery
-```
-→ 190 `.winui` files in `winui_src_test`, then:
-
-```cmd
-winuic.exe -f <all files> -o winui_src_compile_test -n WinUIGallery
-```
-→ **Succeeded 190 / Failed 0 / warnings 0**, and the emitted `.winmd` carries 2966 verbatim raw pairs, 98 state/binding variables, 661 event closures and 16 two-way bindings.
-
-### C++/WinRT project
-```cmd
-xaml2winuic.exe Cpp-WinUI3-MetaScrub-Unpackaged -l cpp
-```
-→ IDL + `.xaml.h` + `.xaml.cpp` merged per view; handlers wired as `.onX { self.Handler(); }`.
+During conversion, `xaml2winuic` scans attribute values for local asset references (`Assets/foo.png`, `ms-appx:///Assets/foo.png`) and automatically copies referenced files from the source tree into the target output tree so assets are preserved next to the generated `.winui` files. The project's root `LICENSE` file is also copied when present.
 
 ---
-
-## Pipeline Verification
-
-The full `Xaml2WinUIC` → `winuic` → `cppwinrtc` pipeline has been verified against two real-world WinUI 3 apps:
-
-| App | XAML Files | `.winui` Emitted | Assets Copied | C++23 Modules | Failures |
-|---|---|---|---|---|---|
-| **MetaScrub** | 7 | 7 | 0 | 31 | 0 |
-| **WinUI Gallery** | 190 | 190 | 69 | 185 | 0 |
-
-All 190 WinUI Gallery XAML files convert cleanly — 0 failures, 0 warnings downstream in `winuic`.
-The emitted `.winui` files pass through `winuic` → `.winmd` → `cppwinrtc -winui` → 31 C++23 named modules (7 view modules + 22 WinRT projection modules + component + main + winrt_base, including the auto-split `Microsoft.UI.Xaml` monolith) all compiled successfully.
-
-### One-shot build with `-winui`
-
-```bat
-:: Full pipeline: xaml → winui → winmd → C++23 modules (all compiled)
-xaml2winuic.exe MetaScrub -l cpp
-winuic.exe -f *.winui -o winuic_out -n MetaScrub
-cppwinrtc.exe -input winuic_out/MetaScrub.winmd -winui -output .
-```
-
-### One-shot build with `-winui`
-
-```bat
-:: Full pipeline: xaml → winui → winmd → C++23 modules (all compiled)
-xaml2winuic.exe MetaScrub -l cpp
-winuic.exe -f *.winui -o winuic_out -n MetaScrub
-cppwinrtc.exe -input winuic_out/MetaScrub.winmd -winui -base -component -output cppwinrtc_full/winrt_projection
-```
-
-3rd-party XAML controls (SettingsCard, Shimmer, WrapPanel, etc.) are preserved through the pipeline — the `winui.json` registry maps them to platform types, and the catalog in the `.winmd` carries `type`, `template_resource_key`, and `resource_dictionary` for downstream projections.
-
----
-
-## Reference-Only Asset Copying
-
-`Xaml2WinUIC` scans every XAML source file for asset references (`ms-appx:///Assets/...`,
-`"Assets/..."` quoted paths) and copies **only the files actually used** to the output
-directory. It walks up from each input file and checks sibling directories for `Assets/`
-folders using Win32 APIs, so it works even when the `.winui` output is in a different
-tree from the original source project.
-
-```
-Xaml2WinUIC --- XAML scanned: 188, .winui emitted: 188, assets copied: 23, failed: 0
-```
-
-No dead assets, no wasted disk space — only the images, icons and resources that the
-XAML files actually reference are copied.
 
 ## Building from Source
 
-Requirements: MSVC (C++23 modules), Windows App SDK headers for the control registry.
-
 ```cmd
-cd Xaml2WinUIC
-cmd /c build.bat
+git clone https://github.com/mominshaikhdev/xaml2winuic-compiler.git
+cd xaml2winuic-compiler
+build.bat
 ```
 
-`build.bat` compiles the module graph (`registry.ixx`, `xaml.ixx`, `lang.ixx`, `convert.ixx`, `extensions.ixx`, `cli.ixx`, …) into `xaml2winuic.exe` next to the sources. The JSON extension loader (`extensions.ixx`) is linked in as `extensions.obj`.
+Requires Visual Studio 2022/2026 with MSVC C++23 modules support.
 
 ---
 
 ## Related
 
-- [`winuic-compiler` — .winui compiler & A-Z grammar reference](https://github.com/mominshaikhdev/winuic-compiler) (the authoritative DSL specification)
-- [`cppwinc-compiler`](https://github.com/mominshaikhdev/cppwinc-compiler) — C++/WinRT projection that consumes the emitted `.winmd`
-- [WinUI 3 Gallery](https://github.com/microsoft/WinUI-Gallery) — the reference corpus used for the 190-file regression suite
+- **[`winuic-compiler`](https://github.com/mominshaikhdev/winuic-compiler)** — Compiles `.winui` files into pure language-agnostic ECMA-335 `.winmd` metadata.
+- **[`CppWinC-Compiler`](https://github.com/mominshaikhdev/CppWinC-Compiler)** — Consumes `.winmd` metadata and emits native C++20/C++23 WinUI 3 binaries.

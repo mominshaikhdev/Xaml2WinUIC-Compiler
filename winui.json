@@ -7,6 +7,7 @@
     "platform_namespace": "Full WinRT namespace",
     "type": "xaml = XAML TemplatedControl with ResourceDictionary; cpp = pure C++/WinRT component (default: cpp)",
     "accepts_children": "bool — can hold child elements (default: false)",
+    "composition_kind": "how children attach on the platform: panel | content | items | items_panel | navigation | navigation_item | documents | blocks | popup | keyboard | icon_source | columns | charts (default: inferred from accepts_children → content)",
     "accepts_text_content": "bool — can hold inline text (default: false)",
     "category": "layout | content | input | navigation | collections | menus | feedback | flyout | dialog | custom",
     "fixed_properties": "[{name, value}] — always set on the control",
@@ -17,6 +18,7 @@
     "_note": "Downstream projection reads 'type' to emit ResourceDictionary merge (xaml) or direct instantiation (cpp). The .winmd carries no language-specific code.",
     "_transforms": "double | int | box | brush | thickness | corner_radius | enum | symbol | font_weight | visibility | nullable_bool | datetime | uri | geopoint"
   },
+  "xamlEvents": [ "Sorted", "Sorting", "ElementClearing", "ElementAdding", "ElementExposed", "ElementPrepared" ],
   "controls": [
 
     {

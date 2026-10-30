@@ -610,7 +610,7 @@ inline auto capture_codebehind_bodies(std::string_view src, CodeBehind& cb) -> v
 
 // §4  C# class extraction
 
-inline auto parse_csharp(std::string_view src) -> CodeBehind {
+inline auto parse_csharp(std::string_view src, std::string_view expected_class = {}) -> CodeBehind {
     CodeBehind cb;
     std::vector<std::string> strings;
     auto toks = tokenize_cs(src, strings);
@@ -619,13 +619,27 @@ inline auto parse_csharp(std::string_view src) -> CodeBehind {
     cb.extends_content_into_titlebar = detect_titlebar_extend(std::string(src));
     cb.window_title = detect_window_title(std::string(src));
 
-    // find "class <Name>" (optionally "partial class") and its base list
+    // find "class <Name>" (optionally "partial class") and its base list.
+    // A code-behind file can declare helper types BEFORE the view class
+    // (ControlExample.xaml.cs starts with ControlExampleSubstitution) —
+    // prefer the class whose name matches the XAML file stem (x:Class short
+    // name); otherwise fall back to the first class as before.
+    auto ci_eq = [](std::string_view a, std::string_view b) {
+        if (a.size() != b.size()) return false;
+        for (std::size_t n = 0; n < a.size(); ++n)
+            if (std::tolower(static_cast<unsigned char>(a[n]))
+                != std::tolower(static_cast<unsigned char>(b[n]))) return false;
+        return true;
+    };
     std::size_t cls = std::string_view::npos;
     for (std::size_t i = 0; i + 1 < toks.size(); ++i) {
         if (toks[i].kind == TokKind::Ident && toks[i].text == "class"
             && i + 1 < toks.size() && toks[i+1].kind == TokKind::Ident) {
-            cls = i;
-            break;
+            if (!expected_class.empty() && ci_eq(toks[i+1].text, expected_class)) {
+                cls = i;
+                break;   // exact match for this .xaml's own class
+            }
+            if (cls == std::string_view::npos) cls = i;   // first-class fallback
         }
     }
     if (cls == std::string_view::npos) return cb;
@@ -671,7 +685,10 @@ inline auto parse_csharp(std::string_view src) -> CodeBehind {
 
     int depth = 0;
     for (std::size_t i = open; i < toks.size(); ++i) {
-        if (toks[i].text == "{") ++depth;
+        if (toks[i].text == "{") {
+            ++depth;
+            continue;
+        }
         if (toks[i].text == "}") {
             --depth;
             if (depth == 0) break; // end of class
@@ -732,14 +749,14 @@ inline auto parse_csharp(std::string_view src) -> CodeBehind {
             type += t.text;
             ++k;
         }
-        if (type.empty() || k >= toks.size()) { ++i; continue; }
+        if (type.empty() || k >= toks.size()) { continue; }
         std::string tname = toks[k].text;
         // member name token:
         //  - followed by '(' → method
         //  - followed by '{' → property
         //  - followed by ';' or '=' → field
         std::size_t after = k + 1;
-        if (after >= toks.size()) { ++i; continue; }
+        if (after >= toks.size()) { continue; }
         std::string next = toks[after].text;
 
         if (next == "(") {
@@ -905,7 +922,10 @@ inline auto parse_cpp_header(std::string_view src) -> CodeBehind {
 
     int depth = 0;
     for (std::size_t i = open; i < toks.size(); ++i) {
-        if (toks[i].text == "{") ++depth;
+        if (toks[i].text == "{") {
+            ++depth;
+            continue;
+        }
         if (toks[i].text == "}") {
             --depth;
             if (depth == 0) break;
@@ -1032,7 +1052,10 @@ inline auto parse_cpp_cx(std::string_view src) -> CodeBehind {
 
     int depth = 0;
     for (std::size_t i = open; i < toks.size(); ++i) {
-        if (toks[i].text == "{") ++depth;
+        if (toks[i].text == "{") {
+            ++depth;
+            continue;
+        }
         if (toks[i].text == "}") {
             --depth;
             if (depth == 0) break;
@@ -1314,7 +1337,10 @@ inline auto parse_idl(std::string_view src) -> CodeBehind {
 
     int depth = 0;
     for (std::size_t i = open; i < toks.size(); ++i) {
-        if (toks[i].text == "{") ++depth;
+        if (toks[i].text == "{") {
+            ++depth;
+            continue;
+        }
         if (toks[i].text == "}") {
             --depth;
             if (depth == 0) break;
