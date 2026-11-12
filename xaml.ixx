@@ -47,7 +47,7 @@ struct Node {
     std::vector<Attribute> attrs;
     std::vector<Node>       children;    // element/comment/cdata children in document order
     std::vector<std::string> text;       // non-whitespace text segments (in order relative to children)
-    // Convenience accessors -------------------------------------------------
+    // Convenience accessors
     [[nodiscard]] auto attr(std::string_view local_name) const -> std::optional<std::string_view>;
     [[nodiscard]] auto has_attr(std::string_view local_name) const -> bool;
     [[nodiscard]] auto text_content() const -> std::string;

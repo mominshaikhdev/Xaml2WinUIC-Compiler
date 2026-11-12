@@ -1,6 +1,6 @@
 # Xaml2WinUIC — WinUI 3 XAML → `.winui` Compiler
 
-A native C++23 converter that scans a project's **WinUI 3 / Windows App SDK XAML** together with its **C# / CppWinC / C++/CX code-behind** and emits a `.winui` source file for every XAML file — a 100% equivalent, projection-agnostic projection that preserves the exact layout, colors, styles, resources, bindings and event wiring of the original markup.
+A native C++23 converter that scans a project's **WinUI 3 / Windows App SDK XAML** together with its **C# / C++/WinRT / C++/CX code-behind** and emits a `.winui` source file for every XAML file — a 100% equivalent, projection-agnostic projection that preserves the exact layout, colors, styles, resources, bindings and event wiring of the original markup.
 
 The emitted `.winui` files are compiled by **[`winuic-compiler`](https://github.com/mominshaikhdev/winuic-compiler)** into a language-agnostic ECMA-335 `.winmd` — no XAML, no IDL, no manual UI code, no partial-class boilerplate.
 
@@ -44,7 +44,7 @@ The emitted `.winui` files are compiled by **[`winuic-compiler`](https://github.
                registry JSON (*.json) ───────────────┘
 ```
 
-The converter is the front half of the pipeline; `winuic` is the grammar/`winmd` reference: **["WinUI Language Specification & A-Z Grammar Reference"](https://github.com/mominshaikhdev/winuic-compiler)**.
+The converter is the front half of the pipeline; `winuic` is the grammar/`winmd` reference: **["WinUI Language Specification & A-Z Grammar Reference"](https://github.com/mominshaikhdev/winuic-compiler#a-to-z-grammar-reference)**.
 
 The `.winui` files are plain text in the project's own source language;
 `winuic` compiles them into a language-projection-agnostic `.winmd`, so any
@@ -66,7 +66,7 @@ with no language baked in.
 ## Features
 
 - **100% equivalent projections** — every XAML attribute and node survives into the `.winui` (and therefore the `.winmd`), so design and behavior are reproduced exactly by the projection.
-- **Dual-language code-behind** — full C# (`partial class`, `x:Bind` targets, event handlers) and C++ (IDL, headers, CppWinC, **C++/CX `ref class` / `property` / `^`**) support. `-l auto|cs|cpp` selects the dialect; auto mode prefers C# when a `.cs` exists and falls back to C++.
+- **Dual-language code-behind** — full C# (`partial class`, `x:Bind` targets, event handlers) and C++ (IDL, headers, C++/WinRT, **C++/CX `ref class` / `property` / `^`**) support. `-l auto|cs|cpp` selects the dialect; auto mode prefers C# when a `.cs` exists and falls back to C++.
 - **ExtendContentIntoTitleBar detection** — automatically detected from all code-behind languages (C# `this.ExtendsContentIntoTitleBar = true`, C++ `this->ExtendsContentIntoTitleBar = true`, C++/CX `this->ExtendsContentIntoTitleBar = true`, IDL) and emitted as `.extendContentIntoTitleBar;` directive.
 - **Event wiring** — XAML `Click="OnClick"` becomes `.onClick { self.OnClick(); }` with the handler emitted as a `callback` declaration; typed parameters on the handler are preserved.
 - **State & bindings** — `x:Class` members referenced by `x:Bind` become `@state`/`@binding` variables; `Mode=TwoWay` is detected and preserved (16 in the WinUI-Gallery conversion); `{Binding ElementName=X, Path=P}` becomes `x.p` member references; `{StaticResource}`/`{ThemeResource}` become resource-key expressions.
@@ -118,7 +118,7 @@ xaml2winuic.exe C:\Projects\MyWinUIApp -c C:\Registries\toolkit.json
 1. **C# wins if it exists**: `Foo.cs` → `Foo.xaml.cs` → `Foo.xaml` are probed. Any found is parsed (native extractor if configured, otherwise the built-in C# tokenizer/parser) and the file is emitted as `// Language: csharp`.
 2. **C++ fallback** (when no C# exists, or `-l cpp`): candidates are merged into a single code-behind:
    - `Foo.idl` / `Foo.xaml.idl` — `runtimeclass` members with exact property types;
-   - `Foo.xaml.h` / `Foo.h` — declared methods and properties (CppWinC headers);
+   - `Foo.xaml.h` / `Foo.h` — declared methods and properties (C++/WinRT headers);
    - `Foo.xaml.cpp` / `Foo.cpp` — implemented methods, event handler signatures.
 
 ### C++/CX
@@ -140,7 +140,7 @@ Every construct that has no abstract `.winui` equivalent is passed through verba
 | Unmapped attribute (e.g. `AutomationProperties.AutomationId="__GoBack"`) | `.raw("AutomationProperties.AutomationId", "__GoBack")` |
 | `x:Name`, `Grid.Row`, `Canvas.ZIndex`, … | `.raw("x:Name", "RootGrid")` |
 | Property Elements (`<Button.Flyout>`, `<SplitView.Pane>`, `<controls:SettingsCard.HeaderIcon>`, `<custom:ThirdParty.Prop>`) | `.raw("Flyout", "<MenuFlyout>...</MenuFlyout>")` / `.raw("HeaderIcon", "...")` |
-| Fragment-family subtrees (`Style`, `RowDefinition`, `DataTemplate`, `ResourceDictionary`, `VisualStateManager.VisualStateGroups`, `Storyboard`, brushes, `x:String`, …) | serialized back to XAML text, carried as `Raw() .raw("Resource", "<…>")` |
+| Fragment-family subtrees (`Style`, `RowDefinition`, `DataTemplate`, `ResourceDictionary`, `VisualStateManager.VisualStateGroups`, `Storyboard`, brushes, `x:String`, …) | serialized back to XAML text with clean 4-space indentation matching original XAML, carried as multiline raw triple-quoted strings `Raw() .raw("Resource", """...""")` without `\"` or `\n` escaping |
 | `xmlns` declarations, element `prefix` (non-`x`/`d`/`mc`) | `.raw("xmlns", …)` / raw prefix pairs |
 | CData / comment content | preserved verbatim inside the raw payload |
 | `Style="{StaticResource Key}"` / `ThemeResource` | resource-key expressions (typed, not raw) |
@@ -151,7 +151,7 @@ Every construct that has no abstract `.winui` equivalent is passed through verba
 
 `Xaml2WinUIC` is engineered so that future WinUI updates, 3rd-party component suites (CommunityToolkit, WinUI Essentials, Syncfusion, DevExpress, Infragistics, Telerik), and arbitrary custom XAML extensions **never require recompiling the converter**:
 
-1. **Whitespace & Tag Resilience**: The XML scanner parses closing tags irrespective of leading/trailing spaces, tabs, or multiline formatting (`</  toolkit:SettingsCard  \r\n>`), preventing parser desynchronization across diverse formatting tools.
+1. **Whitespace & Tag Resilience**: The XML scanner parses closing tags irrespective of leading/trailing spaces, tabs, or multiline formatting (`</  toolkit:SettingsCard  >`), preventing parser desynchronization across diverse formatting tools.
 2. **Universal Property Element Lowering**: Property elements that are not container item collections (`Children`, `Items`, `Child`, `Content`, `Inlines`, `PrimaryCommands`, `SecondaryCommands`, `Commands`, `Tabs`) automatically preserve their property name and serialized child subtree into `.raw("<PropertyName>", "<SerializedContent>")`. The property association is never discarded, and child elements are never improperly dropped into the visual tree.
 3. **Dynamic ECMA-335 Metadata Pass-Through**: The `.winui` DSL carries all raw attributes and fragments into the `.winmd` binary metadata tables without loss. Downstream language projection compilers (`CppWinC`, `CsWinC`, `windows-rs`, `PyWinC`) consume these raw attributes directly from metadata and invoke the corresponding native COM/WinRT setters dynamically.
 
@@ -306,7 +306,7 @@ page MainPage {
 }
 ```
 
-The output conforms to the **[WinUI Language Specification](https://github.com/mominshaikhdev/winuic-compiler)** and is ready for direct consumption by `winuic`.
+The output conforms to the **[WinUI Language Specification](https://github.com/mominshaikhdev/winuic-compiler#a-to-z-grammar-reference)** and is ready for direct consumption by `winuic`.
 
 ---
 

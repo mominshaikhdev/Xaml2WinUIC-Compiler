@@ -1,4 +1,4 @@
-// convert.ixx — WinUI 3 XAML (C# / C++ / C++/WinRT) → .winui converter core
+// convert.ixx — WinUI 3 XAML (C# / C++/CX / C++/WinRT) → .winui converter core
 // Converts a parsed XAML document plus its code-behind (C# / C++ / MIDL)
 // into a .winui source file whose UI tree is 100% equivalent to the XAML.
 
@@ -135,7 +135,32 @@ struct RawPair {
 };
 
 // ".raw(\"key\", \"value\")" — emitted on any control.
-inline auto raw_mod(RawPair const& rp) -> std::string {
+inline auto raw_mod(RawPair const& rp, int depth = 0) -> std::string {
+    bool multiline = (rp.value.find('\n') != std::string::npos || (!rp.value.empty() && rp.value.find('<') != std::string::npos) || rp.value.find('"') != std::string::npos);
+    if (multiline) {
+        std::string ind(depth * 4, ' ');
+        std::string child_ind((depth + 1) * 4, ' ');
+        std::string cleaned;
+        cleaned.reserve(rp.value.size() + 32);
+        for (char c : rp.value) { if (c != '\r') cleaned += c; }
+
+        std::string formatted = "\n";
+        std::size_t pos = 0;
+        while (pos < cleaned.size()) {
+            auto end = cleaned.find('\n', pos);
+            std::string_view line = (end == std::string::npos)
+                ? std::string_view(cleaned).substr(pos)
+                : std::string_view(cleaned).substr(pos, end - pos);
+            if (!line.empty()) {
+                if (line.starts_with(" ")) formatted += line;
+                else { formatted += child_ind; formatted += line; }
+            }
+            formatted += "\n";
+            if (end == std::string::npos) break;
+            pos = end + 1;
+        }
+        return ".raw(" + qstr(rp.key) + ", \"\"\"" + formatted + ind + "\"\"\")";
+    }
     return ".raw(" + qstr(rp.key) + ", " + qstr(rp.value) + ")";
 }
 
@@ -161,23 +186,40 @@ inline auto is_frag_family(std::string_view name) -> bool {
 }
 
 // Serialize an element subtree back into XAML text (verbatim attrs).
-inline auto serialize_fragment(xaml::Node const& el) -> std::string {
-    std::string out = "<";
+inline auto serialize_fragment(xaml::Node const& el, int indent = 0) -> std::string {
+    std::string ind(indent * 4, ' ');
+    std::string out = ind + "<";
     if (!el.prefix.empty()) out += el.prefix + ":";
     out += el.name;
     for (auto const& a : el.attrs) {
         out += " " + a.name + "=\"" + a.value + "\"";
     }
     if (el.self_closing && el.children.empty() && el.text.empty()) {
-        out += "/>";
+        out += " />";
         return out;
     }
     out += ">";
-    for (auto const& t : el.text) out += t;
+    bool has_elem_children = false;
     for (auto const& ch : el.children) {
-        if (ch.kind == xaml::NodeKind::Element) out += serialize_fragment(ch);
-        else if (ch.kind == xaml::NodeKind::Comment) out += "<!--" + ch.name + "-->";
-        else if (ch.kind == xaml::NodeKind::CData) out += "<![CDATA[" + ch.name + "]]>";
+        if (ch.kind == xaml::NodeKind::Element || ch.kind == xaml::NodeKind::Comment || ch.kind == xaml::NodeKind::CData) {
+            has_elem_children = true;
+            break;
+        }
+    }
+    if (has_elem_children) {
+        out += "\n";
+        for (auto const& ch : el.children) {
+            if (ch.kind == xaml::NodeKind::Element) {
+                out += serialize_fragment(ch, indent + 1) + "\n";
+            } else if (ch.kind == xaml::NodeKind::Comment) {
+                out += std::string((indent + 1) * 4, ' ') + "<!--" + ch.name + "-->\n";
+            } else if (ch.kind == xaml::NodeKind::CData) {
+                out += std::string((indent + 1) * 4, ' ') + "<![CDATA[" + ch.name + "]]>\n";
+            }
+        }
+        out += ind;
+    } else {
+        for (auto const& t : el.text) out += t;
     }
     out += "</";
     if (!el.prefix.empty()) out += el.prefix + ":";
@@ -190,7 +232,7 @@ inline auto serialize_fragment(xaml::Node const& el) -> std::string {
 // VisualStateManager.VisualStateGroups, …) and standalone frag-family
 // elements. Returns true when the node was consumed (must NOT be emitted
 // as a normal child).
-inline auto collect_fragment(xaml::Node const& el, std::vector<RawPair>& out) -> bool;
+inline auto collect_fragment(xaml::Node const& el, std::vector<RawPair>& out, int depth = 1) -> bool;
 
 // Recursively collect xmlns declarations from an element tree (deduped by
 // attribute name). Third-party controls are referenced through xmlns
@@ -1249,7 +1291,7 @@ inline auto is_ignorable_attr(std::string_view name) -> bool {
 // VisualStateManager.VisualStateGroups, …) and standalone frag-family
 // elements. Returns true when the node was consumed (must NOT be emitted
 // as a normal child).
-inline auto collect_fragment(xaml::Node const& el, std::vector<RawPair>& out) -> bool {
+inline auto collect_fragment(xaml::Node const& el, std::vector<RawPair>& out, int depth) -> bool {
     bool prop_elem = (el.name.find('.') != std::string::npos);
     if (prop_elem) {
         auto dot = el.name.find_last_of('.');
@@ -1257,7 +1299,10 @@ inline auto collect_fragment(xaml::Node const& el, std::vector<RawPair>& out) ->
         if (prop == "Resources") {
             std::string frag;
             for (auto const& ch : el.children) {
-                if (ch.kind == xaml::NodeKind::Element) frag += serialize_fragment(ch);
+                if (ch.kind == xaml::NodeKind::Element) {
+                    if (!frag.empty()) frag += "\n";
+                    frag += serialize_fragment(ch, depth);
+                }
             }
             if (!frag.empty()) out.push_back({"Resources", std::move(frag)});
             return true;
@@ -1277,8 +1322,14 @@ inline auto collect_fragment(xaml::Node const& el, std::vector<RawPair>& out) ->
             // association is preserved verbatim into raw attributes and metadata.
             std::string frag;
             for (auto const& ch : el.children) {
-                if (ch.kind == xaml::NodeKind::Element) frag += serialize_fragment(ch);
-                else if (ch.kind == xaml::NodeKind::CData) frag += "<![CDATA[" + ch.name + "]]>";
+                if (ch.kind == xaml::NodeKind::Element) {
+                    if (!frag.empty()) frag += "\n";
+                    frag += serialize_fragment(ch, depth);
+                }
+                else if (ch.kind == xaml::NodeKind::CData) {
+                    if (!frag.empty()) frag += "\n";
+                    frag += "<![CDATA[" + ch.name + "]]>";
+                }
             }
             if (frag.empty() && !el.text.empty()) {
                 for (auto const& t : el.text) frag += t;
@@ -1294,7 +1345,7 @@ inline auto collect_fragment(xaml::Node const& el, std::vector<RawPair>& out) ->
         std::string key;
         if (auto k = el.attr("Key")) key = std::string(*k);
         if (key.empty()) key = el.name;
-        out.push_back({std::move(key), serialize_fragment(el)});
+        out.push_back({std::move(key), serialize_fragment(el, depth)});
         return true;
     }
     return false;
@@ -2297,7 +2348,7 @@ inline auto convert_element(Converter& c, xaml::Node const& el) -> void {
     // Fragments (styles, row defs, templates, …) attach to the enclosing
     // control. If THIS node is itself a fragment, hand it to the parent.
     std::vector<RawPair> my_raws;
-    if (collect_fragment(el, my_raws)) {
+    if (collect_fragment(el, my_raws, c.em.depth)) {
         for (auto& rp : my_raws) c.pending_raw.push_back(std::move(rp));
         return;
     }
@@ -2494,7 +2545,7 @@ inline auto convert_element(Converter& c, xaml::Node const& el) -> void {
         if (ch.kind != xaml::NodeKind::Element) continue;
         std::vector<RawPair> frags;
         bool example = is_code_example(ch) && !has_live_example;
-        if (collect_fragment(ch, frags)) {
+        if (collect_fragment(ch, frags, c.em.depth + 1)) {
             for (auto& rp : frags) raws.push_back(std::move(rp));
         }
         if (example) {
@@ -2593,9 +2644,9 @@ inline auto convert_element(Converter& c, xaml::Node const& el) -> void {
     // emit element line
     std::string line = ctrl;
     if (!args.empty()) line += "(" + args + ")";
-    for (auto& rp : c.pending_raw) mods.push_back(raw_mod(rp));
+    for (auto& rp : c.pending_raw) mods.push_back(raw_mod(rp, c.em.depth));
     c.pending_raw.clear();
-    for (auto const& rp : raws) mods.push_back(raw_mod(rp));
+    for (auto const& rp : raws) mods.push_back(raw_mod(rp, c.em.depth));
     // root wrapper events attach to the first real UI element (content root);
     // non-visual helpers declared ahead of it (converters, behaviors) cannot
     // host events like Loaded.
@@ -2661,7 +2712,7 @@ inline auto emit_resource_entries(Converter& c, xaml::Node const& dict) -> void 
         std::string key_note = key ? std::string(" // x:Key=\"" + std::string(*key) + "\"") : "";
         // styles / brushes / templates → verbatim fragment (survives into the .winmd)
         if (is_frag_family(ch.name)) {
-            c.em.line("Raw() " + raw_mod({"Resource", serialize_fragment(ch)}));
+            c.em.line("Raw() " + raw_mod({"Resource", serialize_fragment(ch, c.em.depth + 1)}, c.em.depth));
             continue;
         }
         // registered resources (brushes etc.) — emit as views? no: emit as comment + recurse
@@ -3497,7 +3548,7 @@ export inline auto convert(xaml::ParseResult const& doc, lang::CodeBehind const&
             if (r.name.find('.') != std::string::npos || r.name == "ThemeDictionaries") {
                 emit_resource_entries(c, r);
             } else {
-                c.em.line("Raw() " + raw_mod({"Resource", serialize_fragment(r)}));
+                c.em.line("Raw() " + raw_mod({"Resource", serialize_fragment(r, c.em.depth + 1)}, c.em.depth));
             }
         }
         --em.depth;
