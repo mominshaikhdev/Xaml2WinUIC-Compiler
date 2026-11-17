@@ -326,6 +326,14 @@ build.bat
 
 Requires Visual Studio 2022/2026 with MSVC C++23 modules support.
 
+Run the cross-language callback smoke tests after building:
+
+```powershell
+.\tests\codebehind-neutral-smoke.ps1
+```
+
+The tests cover C#, C++/WinRT, and C++/CX callback lowering, constructor-wired root events, diagnostics for unsupported callback statements, and downstream WinMD emission.
+
 ---
 
 ## Related

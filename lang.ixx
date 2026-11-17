@@ -54,6 +54,7 @@ struct CodeBehind {
     std::vector<Member> properties;    // typed members (x:Bind targets)
     std::vector<std::string> events;   // C# event declarations (public event X Name;)
     std::vector<std::string> methods;  // method names (event handler candidates)
+    std::map<std::string, std::vector<std::string>> method_parameters;
     // code-behind logic: method name -> raw body text (statements inside { })
     std::map<std::string, std::string> method_bodies;
     bool           found = false;
@@ -607,6 +608,24 @@ inline auto capture_codebehind_bodies(std::string_view src, CodeBehind& cb) -> v
     }
 }
 
+export inline auto declared_type_names(std::string_view src) -> std::vector<std::string> {
+    std::vector<std::string> strings;
+    auto toks = tokenize_cs(src, strings);
+    std::vector<std::string> names;
+    for (std::size_t i = 0; i + 1 < toks.size(); ++i) {
+        if (toks[i].kind != TokKind::Ident) continue;
+        auto const& keyword = toks[i].text;
+        if (keyword != "class" && keyword != "struct" && keyword != "interface"
+            && keyword != "enum" && keyword != "record")
+            continue;
+        std::size_t name_idx = i + 1;
+        if (keyword == "record" && (toks[name_idx].text == "class" || toks[name_idx].text == "struct"))
+            ++name_idx;
+        if (name_idx < toks.size() && toks[name_idx].kind == TokKind::Ident)
+            names.push_back(toks[name_idx].text);
+    }
+    return names;
+}
 
 // §4  C# class extraction
 
@@ -764,6 +783,50 @@ inline auto parse_csharp(std::string_view src, std::string_view expected_class =
             bool dup = false;
             for (auto const& m : cb.methods) if (m == tname) dup = true;
             if (!dup && !is_static) cb.methods.push_back(tname);
+            std::vector<std::string> parameters;
+            std::size_t parameter_start = after + 1;
+            std::size_t param = parameter_start;
+            int paren_depth = 1;
+            int angle_depth = 0;
+            int bracket_depth = 0;
+            auto record_parameter = [&](std::size_t begin, std::size_t end) {
+                for (std::size_t n = begin; n < end; ++n) {
+                    if (toks[n].text == "=") {
+                        end = n;
+                        break;
+                    }
+                }
+                for (std::size_t n = end; n > begin; --n) {
+                    if (toks[n - 1].kind == TokKind::Ident) {
+                        auto const& name = toks[n - 1].text;
+                        if (name != "ref" && name != "out" && name != "in"
+                            && name != "this" && name != "params" && name != "scoped")
+                            parameters.push_back(name);
+                        return;
+                    }
+                }
+            };
+            for (; param < toks.size() && paren_depth > 0; ++param) {
+                auto const& token = toks[param].text;
+                if (token == "(") ++paren_depth;
+                else if (token == ")") {
+                    --paren_depth;
+                    if (paren_depth == 0) {
+                        if (param > parameter_start)
+                            record_parameter(parameter_start, param);
+                        break;
+                    }
+                } else if (paren_depth == 1 && token == "<") ++angle_depth;
+                else if (paren_depth == 1 && token == ">" && angle_depth > 0) --angle_depth;
+                else if (paren_depth == 1 && token == "[") ++bracket_depth;
+                else if (paren_depth == 1 && token == "]" && bracket_depth > 0) --bracket_depth;
+                else if (paren_depth == 1 && angle_depth == 0 && bracket_depth == 0 && token == ",") {
+                    record_parameter(parameter_start, param);
+                    parameter_start = param + 1;
+                }
+            }
+            if (!parameters.empty() && !cb.method_parameters.contains(tname))
+                cb.method_parameters.emplace(tname, std::move(parameters));
             // skip to matching ')'
             int pdepth = 1;
             ++after;
@@ -940,6 +1003,48 @@ inline auto parse_cpp_header(std::string_view src) -> CodeBehind {
             || toks[j].text == "protected") && j + 1 < toks.size() && toks[j+1].text == ":") {
             i = j + 1;
             continue;
+        }
+        std::size_t declaration_end = j;
+        bool has_call = false;
+        while (declaration_end < toks.size()
+            && toks[declaration_end].text != ";" && toks[declaration_end].text != "}"
+            && toks[declaration_end].text != "{") {
+            has_call = has_call || toks[declaration_end].text == "(";
+            ++declaration_end;
+        }
+        if (!has_call && declaration_end < toks.size() && toks[declaration_end].text == ";") {
+            std::size_t initializer = declaration_end;
+            for (std::size_t k = j; k < declaration_end; ++k) {
+                if (toks[k].text == "=") {
+                    initializer = k;
+                    break;
+                }
+            }
+            std::size_t field_name = initializer;
+            while (field_name > j && toks[field_name - 1].kind != TokKind::Ident)
+                --field_name;
+            if (field_name > j) {
+                --field_name;
+                std::string type;
+                for (std::size_t k = j; k < field_name; ++k) {
+                    if (!type.empty() && toks[k - 1].kind == TokKind::Ident
+                        && toks[k].kind == TokKind::Ident) {
+                        type += ' ';
+                    }
+                    type += toks[k].text;
+                }
+                if (!type.empty() && type != "using" && type != "typedef") {
+                    Member m;
+                    m.name = toks[field_name].text;
+                    m.type = type;
+                    m.kind = map_type(type);
+                    m.is_field = true;
+                    m.is_static = type.find("static") != std::string::npos;
+                    cb.properties.push_back(std::move(m));
+                }
+                i = declaration_end;
+                continue;
+            }
         }
         // find "ident ident (" pattern
         std::size_t k = j;

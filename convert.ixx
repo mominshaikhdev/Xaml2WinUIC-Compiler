@@ -71,6 +71,8 @@ export struct ConvertOptions {
     bool        emit_resources = true;  // resource dictionaries → resource views
     std::string source_file_path;  // absolute path to source XAML file
     bool        emit_control_view = false; // also emit the code-behind control class view
+    std::vector<std::string> project_view_types;
+    std::vector<std::string> unprojected_source_types;
 };
 
 export struct ConvertResult {
@@ -282,7 +284,8 @@ struct ValueExpr {
 // Element bindings "{Binding ElementName=X, Path=P}" become "x.p".
 // Returns: expression text using `root`-relative state vars; empty if failed.
 inline auto translate_binding(std::string_view inner, std::string& out_mode,
-                              std::string* out_target_null = nullptr) -> std::string {
+                              std::string* out_target_null = nullptr,
+                              std::unordered_map<std::string, std::string> const* element_names = nullptr) -> std::string {
     std::string body(inner);
     out_mode = "";
     if (out_target_null) *out_target_null = "";
@@ -407,9 +410,16 @@ inline auto translate_binding(std::string_view inner, std::string& out_mode,
         // the projection resolves the callee against the view's code-behind.
         if (path.find('(') != std::string::npos) return path;
 
-        // Plain dotted path → lower-camel property chain
+        // Plain dotted path → preserve exact XAML element names, lower-camel properties
         std::string result;
         std::string seg;
+        auto append_segment = [&](std::string const& name) {
+            if (!result.empty()) result += ".";
+            if (result.empty() && element_names && element_names->count(name))
+                result += name;
+            else
+                result += lower_camel(name);
+        };
         for (std::size_t i = 0; i < path.size(); ++i) {
             char c = path[i];
             if (c == '[') {
@@ -419,8 +429,7 @@ inline auto translate_binding(std::string_view inner, std::string& out_mode,
             }
             if (c == '.' || c == '/') {
                 if (!seg.empty()) {
-                    if (!result.empty()) result += ".";
-                    result += lower_camel(seg);
+                    append_segment(seg);
                     seg.clear();
                 }
                 continue;
@@ -428,8 +437,7 @@ inline auto translate_binding(std::string_view inner, std::string& out_mode,
             seg += c;
         }
         if (!seg.empty()) {
-            if (!result.empty()) result += ".";
-            result += lower_camel(seg);
+            append_segment(seg);
         }
         return result;
     };
@@ -461,7 +469,8 @@ inline auto translate_binding(std::string_view inner, std::string& out_mode,
                                                    : pv.substr(pb, pe - pb);
             }
             if (!elem.empty()) {
-                std::string elem_lc = lower_camel(elem);
+                std::string elem_lc = element_names && element_names->count(elem)
+                    ? elem : lower_camel(elem);
                 if (!prop.empty()) {
                     if (elem_lc == "root") {
                         // ElementName=Root → the view root element: bind the
@@ -484,8 +493,13 @@ inline auto translate_binding(std::string_view inner, std::string& out_mode,
 }
 
 // Converts a XAML attribute value into a .winui value expression.
+inline auto lower_nullable_date_formatter(std::string const& expression,
+                                          lang::CodeBehind const* codebehind) -> std::string;
+
 inline auto convert_value(std::string_view raw, std::string_view attr_name,
-                          std::string& comment_out, std::string& mode_out) -> ValueExpr {
+                          std::string& comment_out, std::string& mode_out,
+                          std::unordered_map<std::string, std::string> const* element_names = nullptr,
+                          lang::CodeBehind const* codebehind = nullptr) -> ValueExpr {
     ValueExpr v;
     std::string s(raw);
     // trim
@@ -527,8 +541,9 @@ inline auto convert_value(std::string_view raw, std::string_view attr_name,
         }
         if (kind == "x:Bind" || kind == "Binding") {
             std::string target_null;
-            std::string expr = translate_binding(inner, mode_out, &target_null);
+            std::string expr = translate_binding(inner, mode_out, &target_null, element_names);
             if (!expr.empty()) {
+                expr = lower_nullable_date_formatter(expr, codebehind);
                 v.expr = expr;
                 v.is_binding = true;
                 v.target_null = target_null;
@@ -668,6 +683,7 @@ inline constexpr std::string_view g_event_names[] = {
     "BeginningEdit", "CellEditEnding", "Invoked", "Sorted",
     "ElementClearing", "ElementPrepared", "DetailLabelRequested",
     "IsEnabledChanged", "ViewChangeStarted", "ViewChangeCompleted", "ScrollViewerViewChanged",
+    "ViewChanging",
 };
 
 inline auto xaml_event_to_winui(std::string_view ev) -> std::string {
@@ -715,6 +731,122 @@ inline auto event_handler_value(std::string_view v) -> std::string {
     return "";
 }
 
+inline auto event_invocation_target(std::string_view v) -> std::string {
+    if (v.size() < 2 || v.front() != '{' || v.back() != '}') return "";
+    std::string inner(v.substr(1, v.size() - 2));
+    auto b = inner.find_first_not_of(" \t\r\n");
+    if (b == std::string::npos) return "";
+    inner = inner.substr(b);
+    if (inner.rfind("x:Bind", 0) != 0) return "";
+    std::string path = inner.substr(6);
+    auto end = path.find(',');
+    if (end != std::string::npos) path.resize(end);
+    auto first = path.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos) return "";
+    auto last = path.find_last_not_of(" \t\r\n");
+    path = path.substr(first, last - first + 1);
+    bool has_member = false;
+    bool expect_ident = true;
+    for (unsigned char ch : path) {
+        if (expect_ident) {
+            if (!(std::isalpha(ch) || ch == '_')) return "";
+            expect_ident = false;
+        } else if (ch == '.') {
+            has_member = true;
+            expect_ident = true;
+        } else if (!std::isalnum(ch) && ch != '_') {
+            return "";
+        }
+    }
+    if (!has_member || expect_ident) return "";
+    return path;
+}
+
+inline auto lower_nullable_date_formatter(std::string const& expression,
+                                          lang::CodeBehind const* codebehind) -> std::string {
+    if (!codebehind) return expression;
+    auto const open = expression.find('(');
+    auto const close = expression.rfind(')');
+    if (open == std::string::npos || close != expression.size() - 1 || close <= open + 1)
+        return expression;
+    std::string method = expression.substr(0, open);
+    if (!is_ident(method)) return expression;
+
+    std::string argument = expression.substr(open + 1, close - open - 1);
+    int depth = 0;
+    for (char ch : argument) {
+        if (ch == '(') ++depth;
+        else if (ch == ')') --depth;
+        else if (ch == ',' && depth == 0) return expression;
+        if (depth < 0) return expression;
+    }
+    if (depth != 0) return expression;
+    auto arg_begin = argument.find_first_not_of(" \t\r\n");
+    auto arg_end = argument.find_last_not_of(" \t\r\n");
+    if (arg_begin == std::string::npos) return expression;
+    argument = argument.substr(arg_begin, arg_end - arg_begin + 1);
+
+    auto const body_it = codebehind->method_bodies.find(method);
+    if (body_it == codebehind->method_bodies.end()) return expression;
+    std::string const& body = body_it->second;
+    auto const has_value = body.find(".HasValue");
+    auto const to_string = body.find(".Value.ToString(");
+    auto const else_pos = body.find("else", to_string);
+    if (has_value == std::string::npos || to_string == std::string::npos
+        || else_pos == std::string::npos)
+        return expression;
+
+    auto read_identifier_before = [&](std::size_t pos) {
+        while (pos > 0 && (std::isalnum(static_cast<unsigned char>(body[pos - 1]))
+            || body[pos - 1] == '_')) --pos;
+        return body.substr(pos, (body.find('.', pos) == std::string::npos
+            ? body.size() : body.find('.', pos)) - pos);
+    };
+    std::string const parameter = read_identifier_before(has_value);
+    if (parameter.empty() || to_string < parameter.size()
+        || body.compare(to_string - parameter.size(), parameter.size(), parameter) != 0)
+        return expression;
+
+    auto read_string = [&](std::size_t pos, std::string& value, std::size_t& end) {
+        while (pos < body.size() && std::isspace(static_cast<unsigned char>(body[pos]))) ++pos;
+        if (pos >= body.size() || body[pos] != '"') return false;
+        auto const start = ++pos;
+        while (pos < body.size()) {
+            if (body[pos] == '\\' && pos + 1 < body.size()) { pos += 2; continue; }
+            if (body[pos] == '"') {
+                value = body.substr(start, pos - start);
+                end = pos + 1;
+                return true;
+            }
+            ++pos;
+        }
+        return false;
+    };
+
+    auto const first_return = body.find("return");
+    auto const fallback_return = body.find("return", else_pos);
+    std::string prefix;
+    std::string format;
+    std::string fallback;
+    std::size_t prefix_end = 0;
+    std::size_t format_end = 0;
+    std::size_t fallback_end = 0;
+    if (first_return == std::string::npos || first_return >= to_string
+        || fallback_return == std::string::npos
+        || !read_string(first_return + 6, prefix, prefix_end)
+        || !read_string(body.find('(', to_string) + 1, format, format_end)
+        || !read_string(fallback_return + 6, fallback, fallback_end))
+        return expression;
+    auto const value_call = body.find(parameter + ".Value.ToString(", prefix_end);
+    if (body.find('+', prefix_end) == std::string::npos
+        || value_call == std::string::npos
+        || value_call + parameter.size() != to_string)
+        return expression;
+
+    return "format_datetime(" + argument + ", " + qstr(format) + ", "
+        + qstr(prefix) + ", " + qstr(fallback) + ")";
+}
+
 // §5  Code-behind integration
 
 struct ViewInfo {
@@ -753,6 +885,10 @@ inline auto normalize_cb_type(std::string const& raw) -> std::string {
     if (t.starts_with("Platform::")) t = t.substr(10);
     if (!t.empty() && t.back() == '^') t.pop_back();
     while (!t.empty() && (t.back() == '?' || t.back() == ' ' || t.back() == '\t')) t.pop_back();
+    for (std::size_t pos = 0; (pos = t.find("::", pos)) != std::string::npos; ++pos)
+        t.replace(pos, 2, ".");
+    if (t == "winrt.Windows.UI.Color") t = "Windows.UI.Color";
+    if (t == "Color" || t == "Windows.UI.Color") return "Color";
 
     // generic collections: head<element>
     if (auto lt = t.find('<'); lt != std::string::npos && !t.empty() && t.back() == '>') {
@@ -789,14 +925,18 @@ inline auto normalize_cb_type(std::string const& raw) -> std::string {
 }
 
 // Sanitize a raw code-behind type for direct emission into .winui source.
-// Always returns a type from the .winui vocabulary ("string", "int", "bool",
-// "double", "datetime", "T[]", "any[]") — never a raw C#/C++ annotation
-// like "object?", "Button?" or "TypedEventHandler<A, B>?" (the .winui
-// grammar has no nullable '?'), and never a raw generic like
-// "ObservableCollection<string>" (mapped to "string[]").
+// Custom source-language types are not necessarily present in the WinMD.
 export inline auto sanitize_winui_type(std::string const& raw) -> std::string {
     std::string t = normalize_cb_type(raw);
-    return t.empty() ? "string" : t;
+    if (!t.empty()) return t;
+    return "any";
+}
+
+inline auto is_neutral_state_type(std::string const& type) -> bool {
+    if (type == "any" || type == "datetime") return true;
+    if (type.size() > 2 && type.ends_with("[]"))
+        return is_neutral_state_type(type.substr(0, type.size() - 2));
+    return !normalize_cb_type(type).empty();
 }
 
 // §6  Converter state
@@ -865,9 +1005,30 @@ struct Converter {
         return false;
     }
 
+    static auto refine_var_type(std::vector<std::string>& declarations,
+                                std::string const& name, std::string const& type) -> void {
+        if (type.empty() || type == "any" || type == "object") return;
+        for (auto& declaration : declarations) {
+            if (!declaration.starts_with(name) || declaration.size() <= name.size()
+                || declaration[name.size()] != ':')
+                continue;
+            auto type_begin = declaration.find_first_not_of(" \t", name.size() + 1);
+            if (type_begin == std::string::npos) return;
+            auto type_end = declaration.find(" = ", type_begin);
+            if (type_end == std::string::npos) type_end = declaration.size();
+            std::string current_type = declaration.substr(type_begin, type_end - type_begin);
+            if (current_type == "any" || current_type == "object")
+                declaration.replace(type_begin, type_end - type_begin, type);
+            return;
+        }
+    }
+
     auto ensure_state_var(std::string name, std::string type, std::string init = "") -> void {
         if (is_reserved_word(name)) return;
-        if (!state_set.insert(name).second) return;
+        if (!state_set.insert(name).second) {
+            refine_var_type(state_vars, name, type);
+            return;
+        }
         std::string decl = name + ": " + type;
         if (!init.empty()) decl += " = " + init;
         state_vars.push_back(std::move(decl));
@@ -875,7 +1036,10 @@ struct Converter {
 
     auto ensure_binding_var(std::string name, std::string type, std::string init = "") -> void {
         if (is_reserved_word(name)) return;
-        if (!binding_set.insert(name).second) return;
+        if (!binding_set.insert(name).second) {
+            refine_var_type(binding_vars, name, type);
+            return;
+        }
         std::string decl = name + ": " + type;
         if (!init.empty()) decl += " = " + init;
         binding_vars.push_back(std::move(decl));
@@ -1012,9 +1176,30 @@ struct Converter {
             return;
             }
         }
-        // unknown root → string state/binding var so the output always compiles
+        // unknown root → infer type from target property (suffix_hint) or root name
+        std::string lhint;
+        lhint.reserve(suffix_hint.size());
+        for (char ch : suffix_hint) lhint.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
+
+        std::string lroot;
+        lroot.reserve(root.size());
+        for (char ch : root) lroot.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
+
+        if (lhint.ends_with("itemssource") || lhint == "itemssource" || lhint == "items" ||
+            lroot.ends_with("items") || lroot.ends_with("list") || lroot.ends_with("collection") || lroot.ends_with("samples")) {
+            declare("any[]");
+            return;
+        }
+        if (lhint.starts_with("is") || lhint.starts_with("has") || lhint.starts_with("can") ||
+            lhint == "ischecked" || lhint == "isopen" || lhint == "isenabled" || lhint == "ison" || lhint == "isselected") {
+            declare("bool");
+            return;
+        }
+        if (lhint == "selectedindex" || lhint == "value" || lhint == "width" || lhint == "height" || lhint == "opacity") {
+            declare("double");
+            return;
+        }
         declare("string");
-        (void)suffix_hint;
     }
 };
 
@@ -1075,6 +1260,120 @@ inline auto collect_codebehind_wiring(Converter& c, lang::CodeBehind const& cb) 
         if (!ctrl_type.empty() && ext::is_ext_ctrl_event(ctrl_type, nm)) return true;
         return false;
     };
+    std::size_t root_wire_scan = 0;
+    while ((root_wire_scan = ctor.find("+=", root_wire_scan)) != std::string::npos) {
+        std::size_t statement_start = ctor.find_last_of(";{}\r\n", root_wire_scan);
+        statement_start = statement_start == std::string::npos ? 0 : statement_start + 1;
+        std::string receiver = ctor.substr(statement_start, root_wire_scan - statement_start);
+        auto trim_source = [](std::string value) {
+            auto first = value.find_first_not_of(" \t\r\n");
+            if (first == std::string::npos) return std::string{};
+            auto last = value.find_last_not_of(" \t\r\n");
+            return value.substr(first, last - first + 1);
+        };
+        receiver = trim_source(std::move(receiver));
+        if (receiver.rfind("this.", 0) == 0) receiver.erase(0, 5);
+        else if (receiver.rfind("this->", 0) == 0) receiver.erase(0, 6);
+        if (!is_event_name(receiver, cb.base_class)) {
+            root_wire_scan += 2;
+            continue;
+        }
+
+        std::size_t handler_start = root_wire_scan + 2;
+        std::size_t statement_end = ctor.find(';', handler_start);
+        if (statement_end == std::string::npos) statement_end = ctor.size();
+        std::string expression = trim_source(ctor.substr(handler_start, statement_end - handler_start));
+        std::string handler;
+        if (expression.rfind("ref new ", 0) == 0) {
+            auto amp = expression.find('&');
+            if (amp != std::string::npos) {
+                std::size_t end = amp + 1;
+                while (end < expression.size()
+                    && (std::isalnum(static_cast<unsigned char>(expression[end]))
+                        || expression[end] == '_' || expression[end] == ':')) ++end;
+                std::string qualified = expression.substr(amp + 1, end - amp - 1);
+                auto separator = qualified.find_last_of(':');
+                handler = separator == std::string::npos ? qualified : qualified.substr(separator + 1);
+            }
+        } else {
+            std::size_t end = 0;
+            while (end < expression.size()
+                && (std::isalnum(static_cast<unsigned char>(expression[end])) || expression[end] == '_')) ++end;
+            handler = expression.substr(0, end);
+        }
+        if (!handler.empty() && cb.method_bodies.find(handler) != cb.method_bodies.end()) {
+            c.ensure_callback(handler);
+            c.root_event_mods.push_back("." + xaml_event_to_winui(receiver)
+                + " { self." + handler + "(); }");
+        }
+        root_wire_scan = statement_end == ctor.size() ? statement_end : statement_end + 1;
+    }
+
+    std::size_t root_call_scan = 0;
+    while (root_call_scan < ctor.size()) {
+        std::size_t name_start = root_call_scan;
+        while (name_start < ctor.size()
+            && !(std::isalpha(static_cast<unsigned char>(ctor[name_start])) || ctor[name_start] == '_')) ++name_start;
+        if (name_start == ctor.size()) break;
+        std::size_t name_end = name_start + 1;
+        while (name_end < ctor.size()
+            && (std::isalnum(static_cast<unsigned char>(ctor[name_end])) || ctor[name_end] == '_')) ++name_end;
+        std::string event = ctor.substr(name_start, name_end - name_start);
+        std::size_t open_paren = name_end;
+        while (open_paren < ctor.size() && std::isspace(static_cast<unsigned char>(ctor[open_paren]))) ++open_paren;
+        auto is_base_event = is_event_name(event, cb.base_class);
+        auto prefix = ctor.substr(0, name_start);
+        auto prefix_end = prefix.find_last_not_of(" \t\r\n");
+        std::string_view before = prefix_end == std::string::npos
+            ? std::string_view{} : std::string_view(prefix).substr(0, prefix_end + 1);
+        bool root_receiver = before.empty() || before.ends_with("this.") || before.ends_with("this->");
+        if (!is_base_event || open_paren >= ctor.size() || ctor[open_paren] != '(' || !root_receiver) {
+            root_call_scan = name_end;
+            continue;
+        }
+
+        int paren_depth = 1;
+        std::size_t close_paren = open_paren + 1;
+        bool in_string = false;
+        for (; close_paren < ctor.size() && paren_depth > 0; ++close_paren) {
+            char ch = ctor[close_paren];
+            if (ch == '"' && (close_paren == 0 || ctor[close_paren - 1] != '\\')) in_string = !in_string;
+            if (in_string) continue;
+            if (ch == '(') ++paren_depth;
+            else if (ch == ')') --paren_depth;
+        }
+        if (paren_depth != 0) {
+            root_call_scan = name_end;
+            continue;
+        }
+
+        std::string expression = ctor.substr(open_paren + 1, close_paren - open_paren - 2);
+        std::string handler;
+        auto address = expression.find('&');
+        if (address != std::string::npos) {
+            std::size_t end = address + 1;
+            while (end < expression.size()
+                && (std::isalnum(static_cast<unsigned char>(expression[end]))
+                    || expression[end] == '_' || expression[end] == ':')) ++end;
+            std::string qualified = expression.substr(address + 1, end - address - 1);
+            auto separator = qualified.find_last_of(':');
+            handler = separator == std::string::npos ? qualified : qualified.substr(separator + 1);
+        } else {
+            for (auto const& method : cb.methods) {
+                if (method == cb.class_name || cb.method_bodies.find(method) == cb.method_bodies.end()) continue;
+                auto call = expression.find(method + "(");
+                if (call != std::string::npos) { handler = method; break; }
+            }
+        }
+        if (!handler.empty() && cb.method_bodies.find(handler) != cb.method_bodies.end()) {
+            c.ensure_callback(handler);
+            std::string modifier = "." + xaml_event_to_winui(event) + " { self." + handler + "(); }";
+            if (std::find(c.root_event_mods.begin(), c.root_event_mods.end(), modifier) == c.root_event_mods.end())
+                c.root_event_mods.push_back(std::move(modifier));
+        }
+        root_call_scan = close_paren;
+    }
+
     while (scan < ctor.size()) {
         std::size_t dot = ctor.find('.', scan);
         if (dot == std::string::npos) break;
@@ -1310,7 +1609,7 @@ inline auto collect_fragment(xaml::Node const& el, std::vector<RawPair>& out, in
         // Check if this property element is a standard container content collection
         // that naturally unpacks into child controls in .winui syntax.
         bool is_content_collection = (prop == "Children" || prop == "Items" || prop == "Child" ||
-                                      prop == "Content" || prop == "Inlines" || prop == "PrimaryCommands" ||
+                                      prop == "Content" || prop == "Description" || prop == "Inlines" || prop == "PrimaryCommands" ||
                                       prop == "SecondaryCommands" || prop == "Commands" || prop == "Tabs" ||
                                       prop == "Source" || prop == "MenuItems" || prop == "FooterMenuItems" ||
                                       prop == "TabItems" || prop == "Icon" || prop == "Example" ||
@@ -1573,6 +1872,10 @@ inline auto emit_attributes(Converter& c, xaml::Node const& el, std::string cons
                     if (auto xe = ext::ext_xaml_event(ctrl_name, local)) wev = *xe;
                     c.ensure_callback(handler);
                     mods.push_back("." + wev + " { self." + handler + "(); }");
+                } else if (std::string target = event_invocation_target(a.value); !target.empty()) {
+                    std::string wev = xaml_event_to_winui(local);
+                    if (auto xe = ext::ext_xaml_event(ctrl_name, local)) wev = *xe;
+                    mods.push_back("." + wev + " { self." + target + "(); }");
                 } else {
                     raws.push_back({aname, std::string(a.value)});
                 }
@@ -1591,7 +1894,7 @@ inline auto emit_attributes(Converter& c, xaml::Node const& el, std::string cons
 
                 std::string comment;
                 std::string mode;
-                auto v = convert_value(a.value, local, comment, mode);
+                auto v = convert_value(a.value, local, comment, mode, &c.element_names, c.cb);
                 if (v.is_binding) {
                     c.record_binding_root(v.expr, mode, local, v.target_null);
                     std::string fexpr = c.flatten_cb_path(v.expr);
@@ -1693,7 +1996,7 @@ inline auto emit_attributes(Converter& c, xaml::Node const& el, std::string cons
                     if (ex_xaml != local) continue;
                     std::string ex_mode;
                     std::string ex_comment;
-                    auto v = convert_value(a.value, local, ex_comment, ex_mode);
+                    auto v = convert_value(a.value, local, ex_comment, ex_mode, &c.element_names, c.cb);
                     if (v.is_binding) {
                         c.record_binding_root(v.expr, ex_mode, local);
                         mods.push_back("." + ex_winui + "(" + c.flatten_cb_path(v.expr) + ")");
@@ -1816,7 +2119,7 @@ inline auto emit_attributes(Converter& c, xaml::Node const& el, std::string cons
 
             std::string comment;
             std::string mode;
-            auto v = convert_value(a.value, local, comment, mode);
+            auto v = convert_value(a.value, local, comment, mode, &c.element_names, c.cb);
             if (v.is_binding) {
                 c.record_binding_root(v.expr, mode, local, v.target_null);
                 // two-way on input-ish properties → $ binding ref
@@ -2384,87 +2687,6 @@ inline auto convert_element(Converter& c, xaml::Node const& el) -> void {
         c.active_slot.clear();
     }
 
-    if (ctrl == "ControlExample") {
-        if (auto sd = el.attr("SampleDefinition"); sd && !sd->empty()) {
-            std::string rel(*sd);
-            for (char& ch : rel) if (ch == '/') ch = '\\';
-            std::vector<std::string> scands;
-            if (c.opts && !c.opts->source_file_path.empty()) {
-                std::string cur = c.opts->source_file_path;
-                for (int up = 0; up < 5; ++up) {
-                    auto p = cur.find_last_of("\\/");
-                    if (p == std::string::npos) break;
-                    cur = cur.substr(0, p);
-                    scands.push_back(cur + "\\Samples\\" + rel);
-                    scands.push_back(cur + "\\WinUIGallery\\Samples\\" + rel);
-                }
-            }
-            scands.push_back("Samples\\" + rel);
-            scands.push_back("WinUIGallery\\Samples\\" + rel);
-            scands.push_back("..\\WinUIGallery\\Samples\\" + rel);
-            scands.push_back("..\\WinUI-Gallery\\WinUIGallery\\Samples\\" + rel);
-            std::string scontent;
-            for (auto const& sp : scands) {
-                FILE* fp = nullptr;
-#ifdef _WIN32
-                fopen_s(&fp, sp.c_str(), "rb");
-#else
-                fp = fopen(sp.c_str(), "rb");
-#endif
-                if (fp) {
-                    fseek(fp, 0, SEEK_END);
-                    long sz = ftell(fp);
-                    fseek(fp, 0, SEEK_SET);
-                    if (sz > 0) {
-                        scontent.resize(static_cast<size_t>(sz));
-                        fread(scontent.data(), 1, static_cast<size_t>(sz), fp);
-                    }
-                    fclose(fp);
-                    if (!scontent.empty()) break;
-                }
-            }
-            if (!scontent.empty()) {
-                std::string sec_header, sec_xaml, sec_cs, cur_sec;
-                std::string cur_buf;
-                auto flush_sec = [&]() {
-                    while (!cur_buf.empty() && (cur_buf.front() == '\r' || cur_buf.front() == '\n' || cur_buf.front() == ' ')) cur_buf.erase(cur_buf.begin());
-                    while (!cur_buf.empty() && (cur_buf.back() == '\r' || cur_buf.back() == '\n' || cur_buf.back() == ' ')) cur_buf.pop_back();
-                    if (cur_sec == "header") sec_header = cur_buf;
-                    else if (cur_sec == "xaml") sec_xaml = cur_buf;
-                    else if (cur_sec == "c#" || cur_sec == "csharp") sec_cs = cur_buf;
-                    cur_buf.clear();
-                };
-                std::size_t pos = 0;
-                while (pos < scontent.size()) {
-                    auto nl = scontent.find('\n', pos);
-                    std::string ln = scontent.substr(pos, (nl == std::string::npos) ? scontent.size() - pos : nl - pos);
-                    if (!ln.empty() && ln.back() == '\r') ln.pop_back();
-                    if (ln.rfind("--- ", 0) == 0) {
-                        flush_sec();
-                        cur_sec = ln.substr(4);
-                        while (!cur_sec.empty() && (cur_sec.back() == ' ' || cur_sec.back() == '\t')) cur_sec.pop_back();
-                        for (char& ch : cur_sec) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
-                    } else {
-                        if (!cur_buf.empty()) cur_buf += '\n';
-                        cur_buf += ln;
-                    }
-                    if (nl == std::string::npos) break;
-                    pos = nl + 1;
-                }
-                flush_sec();
-                if (!sec_header.empty() && !el.has_attr("HeaderText")) {
-                    raws.push_back({"HeaderText", sec_header});
-                }
-                if (!sec_xaml.empty() && !el.has_attr("Xaml")) {
-                    raws.push_back({"Xaml", sec_xaml});
-                }
-                if (!sec_cs.empty() && !el.has_attr("CSharp")) {
-                    raws.push_back({"CSharp", sec_cs});
-                }
-            }
-        }
-    }
-
     std::string xname;
     for (auto const& a : el.attrs) {
         auto colon = a.name.find(':');
@@ -2785,6 +3007,13 @@ inline auto only_known_idents(std::string const& s, std::unordered_set<std::stri
             bool after_dot = (b > 0 && s[b - 1] == '.');
             if (after_dot) continue;
             if (id == "true" || id == "false" || id == "null") continue;
+            if (is_known_ident(known, "!" + id)) return false;
+            if (!is_known_ident(known, id) && std::isupper(static_cast<unsigned char>(id.front()))) {
+                std::size_t next = i;
+                while (next < s.size() && std::isspace(static_cast<unsigned char>(s[next]))) ++next;
+                if (next < s.size() && s[next] == '.') continue;
+                if (id == "NavigateTo" && next < s.size() && s[next] == '(') continue;
+            }
             if (!is_known_ident(known, id)) return false;
             continue;
         }
@@ -2816,10 +3045,48 @@ inline auto neutral_expr_ok(std::string const& s) -> bool {
     static constexpr std::string_view bad[] = {
         "::", "->", "co_await", " await", "L\"", "hstring", "std::", "winrt::",
         "Windows::", "Microsoft::", "nullptr", "typeof", " sizeof", " typeid",
-        "new ", "delete ", "=>", "?.", "?[", "[", "{", "}", "co_", " is ",
+        "new ", "delete ", "$\"", "=>", "?.", "?[", "[", "{", "}", "co_", " is ",
         " as ", "default:", "public:", "private:", "protected:",
     };
     for (auto const& b : bad) if (s.find(b) != std::string::npos) return false;
+    for (std::size_t close = 0; close < s.size(); ++close) {
+        if (s[close] != ')') continue;
+        auto after = close + 1;
+        while (after < s.size() && (s[after] == ' ' || s[after] == '\t')) ++after;
+        if (after >= s.size()
+            || !(std::isalpha(static_cast<unsigned char>(s[after])) || s[after] == '_'))
+            continue;
+        int depth = 1;
+        auto open = close;
+        while (open > 0 && depth > 0) {
+            --open;
+            if (s[open] == ')') ++depth;
+            else if (s[open] == '(') --depth;
+        }
+        if (depth != 0) continue;
+        auto type_begin = open + 1;
+        while (type_begin < close && (s[type_begin] == ' ' || s[type_begin] == '\t')) ++type_begin;
+        auto type_end = close;
+        while (type_end > type_begin && (s[type_end - 1] == ' ' || s[type_end - 1] == '\t')) --type_end;
+        if (type_begin < type_end) {
+            std::string_view type_path(s.data() + type_begin, type_end - type_begin);
+            bool cast_type = true;
+            bool segment_start = true;
+            for (char ch : type_path) {
+                if (std::isalnum(static_cast<unsigned char>(ch)) || ch == '_') {
+                    segment_start = false;
+                    continue;
+                }
+                if (ch == '.' || (ch == ':' && !segment_start)) {
+                    segment_start = true;
+                    continue;
+                }
+                cast_type = false;
+                break;
+            }
+            if (cast_type && !segment_start) return false;
+        }
+    }
     // template instantiations: ident immediately followed by '<'
     for (std::size_t i = 0; i + 1 < s.size(); ++i) {
         if (s[i] == '<' && i > 0 && (std::isalnum(static_cast<unsigned char>(s[i - 1])) || s[i - 1] == '_')) return false;
@@ -2896,6 +3163,19 @@ inline auto neutral_statement_ok(std::string const& s, std::unordered_set<std::s
             if (c == '=' && depth == 0) {
                 if (i + 1 < t.size() && t[i + 1] == '=') return false;
                 if (i > 0 && (t[i - 1] == '!' || t[i - 1] == '<' || t[i - 1] == '>')) return false;
+                std::string lhs = t.substr(0, i);
+                auto lhs_begin = lhs.find_first_not_of(" \t");
+                auto lhs_end = lhs.find_last_not_of(" \t");
+                if (lhs_begin == std::string::npos) return false;
+                lhs = lhs.substr(lhs_begin, lhs_end - lhs_begin + 1);
+                std::size_t p = 0;
+                while (p < lhs.size()) {
+                    if (!(std::isalpha(static_cast<unsigned char>(lhs[p])) || lhs[p] == '_')) return false;
+                    while (p < lhs.size()
+                        && (std::isalnum(static_cast<unsigned char>(lhs[p])) || lhs[p] == '_')) ++p;
+                    if (p == lhs.size()) break;
+                    if (lhs[p++] != '.' || p == lhs.size()) return false;
+                }
                 return true;
             }
         }
@@ -3050,8 +3330,32 @@ inline auto split_assign_chain(std::string const& s_in, std::vector<std::string>
     return true;
 }
 
+inline auto normalize_source_literals(std::string s) -> std::string {
+    for (std::size_t i = 1; i < s.size(); ++i) {
+        if (s[i] != '"' || s[i - 1] != 'L') continue;
+        if (i > 1 && (std::isalnum(static_cast<unsigned char>(s[i - 2])) || s[i - 2] == '_')) continue;
+        s.erase(i - 1, 1);
+        --i;
+    }
+    return s;
+}
+
+inline auto lower_element_arrow_access(std::string s, std::unordered_set<std::string> const& known) -> std::string {
+    auto begin = s.find_first_not_of(" \t");
+    if (begin == std::string::npos) return s;
+    std::size_t end = begin;
+    while (end < s.size() && (std::isalnum(static_cast<unsigned char>(s[end])) || s[end] == '_')) ++end;
+    if (end == begin || !is_known_ident(known, s.substr(begin, end - begin))) return s;
+    if (s.compare(end, 2, "->") == 0) s.replace(end, 2, ".");
+    return s;
+}
+
 // Translate one plain statement, honoring the whitelist.
 inline auto translate_plain_stmt(std::string s, std::unordered_set<std::string> const& known) -> std::string {
+    s = normalize_source_literals(std::move(s));
+    for (auto const& pre : { std::string_view("this->"), std::string_view("self->"), std::string_view("this."), std::string_view("self.") })
+        while (s.rfind(pre, 0) == 0) s = s.substr(pre.size());
+    s = lower_element_arrow_access(std::move(s), known);
     // Desugar right-associative assignment chains (a = b = c = v): the .winui
     // grammar takes a single target per '=', so emit one assignment per target.
     std::vector<std::string> chain_parts;
@@ -3075,6 +3379,28 @@ inline auto translate_plain_stmt(std::string s, std::unordered_set<std::string> 
         for (auto const& pre : { std::string_view("this->"), std::string_view("self->"), std::string_view("this."), std::string_view("self.") })
             while (s.rfind(pre, 0) == 0) s = s.substr(pre.size());
     }
+    // App navigation is represented by its metadata route tag in .winui;
+    // the destination Type is intentionally not carried into the DSL.
+    {
+        auto nav = s.find(".Navigate(typeof(");
+        if (nav != std::string::npos) {
+            auto first_close = s.find(')', nav + 16);
+            if (first_close != std::string::npos) {
+                auto comma = s.find(',', first_close + 1);
+                auto close = s.find_last_of(')');
+                if (comma != std::string::npos && close != std::string::npos && comma < close) {
+                    std::string route = s.substr(comma + 1, close - comma - 1);
+                    auto rb = route.find_first_not_of(" \t");
+                    auto re = route.find_last_not_of(" \t");
+                    if (rb != std::string::npos) {
+                        route = route.substr(rb, re - rb + 1);
+                        auto lowered = "NavigateTo(" + route + ")";
+                        if (neutral_expr_ok(lowered)) return lowered + "\n";
+                    }
+                }
+            }
+        }
+    }
     std::string lowered;
     if (lower_element_setter(s, known, lowered)) {
         return lowered + "\n";
@@ -3086,6 +3412,25 @@ inline auto translate_plain_stmt(std::string s, std::unordered_set<std::string> 
 }
 inline auto codebehind_body_to_winui(std::string const& body_in,
                                      std::unordered_set<std::string> const& known) -> std::string {
+    auto matching_paren = [](std::string const& text, std::size_t open) {
+        int depth = 0;
+        char quote = '\0';
+        bool escaped = false;
+        for (std::size_t i = open; i < text.size(); ++i) {
+            char ch = text[i];
+            if (quote != '\0') {
+                if (escaped) escaped = false;
+                else if (ch == '\\') escaped = true;
+                else if (ch == quote) quote = '\0';
+                continue;
+            }
+            if (ch == '"' || ch == '\'') quote = ch;
+            else if (ch == '(') ++depth;
+            else if (ch == ')' && --depth == 0) return i;
+        }
+        return std::string::npos;
+    };
+
     // Strip wrapper braces if present
     std::string body = body_in;
     {
@@ -3102,6 +3447,119 @@ inline auto codebehind_body_to_winui(std::string const& body_in,
         }
     }
     normalize_verbatim_strings(body);
+    body = normalize_source_literals(std::move(body));
+    std::string guarded_tag_name;
+    // A guarded C# sender-Tag pattern can be lowered to the event's neutral
+    // sender reference. The guard's early return only rejects an absent or
+    // non-string Tag; the normalized expression is handled by the projection.
+    {
+        std::size_t search = 0;
+        while ((search = body.find("if", search)) != std::string::npos) {
+            if (search > 0 && (std::isalnum(static_cast<unsigned char>(body[search - 1])) || body[search - 1] == '_')) {
+                search += 2;
+                continue;
+            }
+            auto lp = body.find('(', search + 2);
+            if (lp == std::string::npos) break;
+            int parens = 1;
+            std::size_t rp = lp + 1;
+            bool in_string = false;
+            for (; rp < body.size() && parens > 0; ++rp) {
+                char ch = body[rp];
+                if (ch == '"' && (rp == 0 || body[rp - 1] != '\\')) in_string = !in_string;
+                if (in_string) continue;
+                if (ch == '(') ++parens;
+                else if (ch == ')') --parens;
+            }
+            if (parens != 0) break;
+            std::string condition = body.substr(lp + 1, rp - lp - 2);
+            auto open = body.find('{', rp);
+            if (open == std::string::npos) break;
+            int braces = 1;
+            std::size_t close = open + 1;
+            in_string = false;
+            for (; close < body.size() && braces > 0; ++close) {
+                char ch = body[close];
+                if (ch == '"' && (close == 0 || body[close - 1] != '\\')) in_string = !in_string;
+                if (in_string) continue;
+                if (ch == '{') ++braces;
+                else if (ch == '}') --braces;
+            }
+            if (braces != 0) break;
+            std::string guarded_body = body.substr(open + 1, close - open - 2);
+            bool is_tag_type_guard = condition.find(".Tag") != std::string::npos
+                && condition.find(" is not string ") != std::string::npos
+                && guarded_body.find("return") != std::string::npos;
+            if (!is_tag_type_guard) {
+                search = close;
+                continue;
+            }
+            auto tag_begin = condition.find(" is not string ");
+            if (tag_begin != std::string::npos) {
+                tag_begin += std::string_view(" is not string ").size();
+                while (tag_begin < condition.size() && std::isspace(static_cast<unsigned char>(condition[tag_begin]))) ++tag_begin;
+                auto tag_end = tag_begin;
+                while (tag_end < condition.size()
+                    && (std::isalnum(static_cast<unsigned char>(condition[tag_end])) || condition[tag_end] == '_')) ++tag_end;
+                if (tag_end > tag_begin) guarded_tag_name = condition.substr(tag_begin, tag_end - tag_begin);
+            }
+            body.erase(search, close - search);
+            search = 0;
+        }
+    }
+    // Lower a numeric XAML Tag parse/cast chain to a typed sender.Tag
+    // expression. The callback runtime supplies sender, so these source
+    // locals do not need to leak into the projection-neutral DSL.
+    {
+        auto parse = body.find("int.Parse(");
+        auto tag_member = body.find(".Tag");
+        if (parse != std::string::npos
+            && (tag_member != std::string::npos || !guarded_tag_name.empty())) {
+            if (!guarded_tag_name.empty()) {
+                auto parse_arg_end = body.find(')', parse + 10);
+                if (parse_arg_end == std::string::npos
+                    || body.substr(parse + 10, parse_arg_end - (parse + 10)).find(guarded_tag_name) == std::string::npos)
+                    parse = std::string::npos;
+            }
+        }
+        if (parse != std::string::npos && (tag_member != std::string::npos || !guarded_tag_name.empty())) {
+            auto lhs_end = body.rfind('=', parse);
+            if (lhs_end != std::string::npos) {
+                auto declaration_separator = body.find_last_of(";\r\n{}", lhs_end);
+                auto declaration_begin = declaration_separator == std::string::npos ? 0 : declaration_separator + 1;
+                auto declaration_end = body.find(';', parse);
+                std::string lhs = body.substr(0, lhs_end);
+                auto local_end = lhs.find_last_not_of(" \t\r\n");
+                auto local_begin = local_end;
+                while (local_begin != std::string::npos
+                    && (std::isalnum(static_cast<unsigned char>(lhs[local_begin])) || lhs[local_begin] == '_')) {
+                    if (local_begin == 0) { local_begin = std::string::npos; break; }
+                    --local_begin;
+                }
+                std::string local;
+                if (local_end != std::string::npos)
+                    local = lhs.substr(local_begin == std::string::npos ? 0 : local_begin + 1,
+                                       local_end - (local_begin == std::string::npos ? 0 : local_begin + 1) + 1);
+                if (!local.empty() && is_ident(local)) {
+                    std::string cast_pattern = ")" + local;
+                    auto cast_end = body.find(cast_pattern, parse);
+                    if (cast_end != std::string::npos) {
+                        auto cast_open = body.rfind('(', cast_end);
+                        if (cast_open != std::string::npos) {
+                            std::string enum_type = body.substr(cast_open + 1, cast_end - cast_open - 1);
+                            if (!enum_type.empty() && is_ident(enum_type)
+                                && std::isupper(static_cast<unsigned char>(enum_type.front()))) {
+                                body.replace(cast_open, cast_end + cast_pattern.size() - cast_open,
+                                             enum_type + "(sender.Tag)");
+                                if (declaration_end != std::string::npos)
+                                    body.erase(declaration_begin, declaration_end - declaration_begin + 1);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
     std::vector<std::string> stmts;
     {
         std::string cur; int bal = 0; bool in_s = false;
@@ -3114,12 +3572,80 @@ inline auto codebehind_body_to_winui(std::string const& body_in,
             if (c == '\"' && (i == 0 || body[i-1] != '\\')) in_s = !in_s;
             if (!in_s) {
                 if (c == '{') ++bal;
-                else if (c == '}') { if (bal > 0) --bal; cur += c; continue; }
+                else if (c == '}') {
+                    if (bal > 0) --bal;
+                    cur += c;
+                    if (bal == 0) {
+                        std::size_t next = i + 1;
+                        while (next < body.size() && std::isspace(static_cast<unsigned char>(body[next]))) ++next;
+                        bool continues_else = body.compare(next, 4, "else") == 0
+                            && (next + 4 == body.size()
+                                || !(std::isalnum(static_cast<unsigned char>(body[next + 4])) || body[next + 4] == '_'));
+                        if (!continues_else) {
+                            stmts.push_back(cur);
+                            cur.clear();
+                        }
+                    }
+                    continue;
+                }
             }
             cur += c;
             if (!in_s && bal == 0 && c == ';') { stmts.push_back(cur); cur.clear(); }
         }
         if (!cur.empty()) stmts.push_back(cur);
+    }
+    // Inline simple source locals whose initializer is already expressible in
+    // the neutral language. This keeps local names out of .winui while
+    // preserving uses in later switch/conditional expressions.
+    auto trim_stmt = [](std::string value) {
+        auto b = value.find_first_not_of(" \t\r\n");
+        if (b == std::string::npos) return std::string{};
+        auto e = value.find_last_not_of(" \t\r\n;");
+        return value.substr(b, e - b + 1);
+    };
+    auto replace_identifier = [](std::string& text, std::string const& name,
+                                 std::string const& replacement) {
+        bool in_string = false;
+        bool escaped = false;
+        for (std::size_t i = 0; i < text.size();) {
+            char ch = text[i];
+            if (in_string) {
+                if (escaped) escaped = false;
+                else if (ch == '\\') escaped = true;
+                else if (ch == '"') in_string = false;
+                ++i;
+                continue;
+            }
+            if (ch == '"') { in_string = true; ++i; continue; }
+            if (text.compare(i, name.size(), name) == 0
+                && (i == 0 || !(std::isalnum(static_cast<unsigned char>(text[i - 1])) || text[i - 1] == '_'))
+                && (i + name.size() == text.size()
+                    || !(std::isalnum(static_cast<unsigned char>(text[i + name.size()])) || text[i + name.size()] == '_'))) {
+                text.replace(i, name.size(), replacement);
+                i += replacement.size();
+                continue;
+            }
+            ++i;
+        }
+    };
+    for (std::size_t i = 0; i < stmts.size();) {
+        std::string statement = trim_stmt(stmts[i]);
+        std::size_t type_end = 0;
+        if (statement.rfind("var ", 0) == 0) type_end = 4;
+        else if (statement.rfind("auto ", 0) == 0) type_end = 5;
+        if (type_end == 0) { ++i; continue; }
+        std::size_t eq = statement.find('=', type_end);
+        if (eq == std::string::npos) { ++i; continue; }
+        std::string name = trim_stmt(statement.substr(type_end, eq - type_end));
+        std::string value = trim_stmt(statement.substr(eq + 1));
+        if (!is_ident(name) || value.empty() || !neutral_expr_ok(value)
+            || !only_known_idents(value, known)) {
+            ++i;
+            continue;
+        }
+        for (std::size_t j = i + 1; j < stmts.size(); ++j)
+            replace_identifier(stmts[j], name, "(" + value + ")");
+        stmts.erase(stmts.begin() + static_cast<std::ptrdiff_t>(i));
     }
     std::string out;
     for (auto const& st : stmts) {
@@ -3133,13 +3659,20 @@ inline auto codebehind_body_to_winui(std::string const& body_in,
         // if (...) { ... } else { ... } — condition must be neutral too
         if (s.rfind("if", 0) == 0 && (s.size() == 2 || !(std::isalnum(static_cast<unsigned char>(s[2])) || s[2] == '_'))) {
             auto lp = s.find('(');
-            auto rp = s.find(')', lp);
+            auto rp = lp == std::string::npos ? std::string::npos : matching_paren(s, lp);
             if (lp == std::string::npos || rp == std::string::npos) { out += comment_every_line(s); continue; }
             std::string cond = s.substr(lp + 1, rp - lp - 1);
             auto ob = s.find('{', rp);
-            if (ob == std::string::npos) { out += comment_every_line(s); continue; }
             // condition may only use known idents, literals and operators
             if (!neutral_expr_ok(cond) || !only_known_idents(cond, known)) { out += comment_every_line(s); continue; }
+            if (ob == std::string::npos) {
+                std::string inline_body = s.substr(rp + 1);
+                if (trim_stmt(inline_body).empty()) { out += comment_every_line(s); continue; }
+                out += "if (" + cond + ") {\n";
+                out += codebehind_body_to_winui(inline_body, known);
+                out += "}\n";
+                continue;
+            }
             int bal = 1; std::size_t i2 = ob + 1; bool in_s = false;
             for (; i2 < s.size(); ++i2) {
                 char c = s[i2];
@@ -3172,7 +3705,8 @@ inline auto codebehind_body_to_winui(std::string const& body_in,
 
         // switch (x) { case ... } -> if/else-if chain (subject must be neutral)
         if (s.rfind("switch", 0) == 0 && (s.size() == 6 || !(std::isalnum(static_cast<unsigned char>(s[6])) || s[6] == '_'))) {
-            auto lp = s.find('('); auto rp = s.find(')', lp);
+            auto lp = s.find('(');
+            auto rp = lp == std::string::npos ? std::string::npos : matching_paren(s, lp);
             if (lp == std::string::npos || rp == std::string::npos) { out += comment_every_line(s); continue; }
             std::string subj = s.substr(lp + 1, rp - lp - 1);
             if (!neutral_expr_ok(subj) || !only_known_idents(subj, known)) { out += comment_every_line(s); continue; }
@@ -3247,25 +3781,76 @@ inline auto emit_callback_decl(Emitter& em, lang::CodeBehind const& cb_code,
     // in a callback body (x:Name elements, state/binding vars, code-behind
     // props). Everything else is a source-language local -> commented out.
     std::unordered_set<std::string> known;
-    for (auto const& [nm, ty] : c.element_names) { (void)ty; known.insert(nm); }
-    for (auto const& [nm, m] : c.cb_props) { (void)m; known.insert(nm); }
-    for (auto const& sv : c.state_vars) {
-        auto sp = sv.find(':');
-        std::string nm = (sp == std::string::npos) ? sv : sv.substr(0, sp);
+    for (auto const& [nm, ty] : c.element_names)
+        if (!ty.empty()) known.insert(nm);
+    known.insert("sender");
+    known.insert("args");
+    for (auto const& [nm, m] : c.cb_props)
+        if (!normalize_cb_type(m.type).empty()) known.insert(nm);
+    for (auto const& type : c.opts->project_view_types) known.insert(type);
+    for (auto const& type : c.opts->unprojected_source_types)
+        known.insert("!" + type);
+    auto add_typed_state = [&](std::string const& declaration) {
+        auto sp = declaration.find(':');
+        if (sp == std::string::npos) return;
+        auto eq = declaration.find('=', sp + 1);
+        std::string type = declaration.substr(sp + 1, eq == std::string::npos
+            ? std::string::npos : eq - sp - 1);
+        auto type_begin = type.find_first_not_of(" \t");
+        auto type_end = type.find_last_not_of(" \t");
+        if (type_begin == std::string::npos) return;
+        type = type.substr(type_begin, type_end - type_begin + 1);
+        if (type == "any" || !is_neutral_state_type(type)) return;
+        std::string nm = declaration.substr(0, sp);
         auto b = nm.find_first_not_of(" \t");
         auto e = nm.find_last_not_of(" \t");
         if (b != std::string::npos) known.insert(nm.substr(b, e - b + 1));
-    }
-    for (auto const& bv : c.binding_vars) {
-        auto sp = bv.find(':');
-        std::string nm = (sp == std::string::npos) ? bv : bv.substr(0, sp);
-        auto b = nm.find_first_not_of(" \t");
-        auto e = nm.find_last_not_of(" \t");
-        if (b != std::string::npos) known.insert(nm.substr(b, e - b + 1));
-    }
+    };
+    for (auto const& sv : c.state_vars) add_typed_state(sv);
+    for (auto const& bv : c.binding_vars) add_typed_state(bv);
     auto it = cb_code.method_bodies.find(name);
-    if (it != cb_code.method_bodies.end() && !it->second.empty())
-        body = codebehind_body_to_winui(it->second, known);
+    if (it != cb_code.method_bodies.end() && !it->second.empty()) {
+        std::string source_body = it->second;
+        auto replace_identifier = [](std::string& text, std::string const& from,
+                                     std::string const& to) {
+            if (from.empty() || from == to) return;
+            bool in_string = false;
+            bool in_char = false;
+            bool escaped = false;
+            for (std::size_t i = 0; i < text.size();) {
+                char ch = text[i];
+                if (in_string || in_char) {
+                    if (escaped) escaped = false;
+                    else if (ch == '\\') escaped = true;
+                    else if ((in_string && ch == '"') || (in_char && ch == '\'')) {
+                        in_string = false;
+                        in_char = false;
+                    }
+                    ++i;
+                    continue;
+                }
+                if (ch == '"') { in_string = true; ++i; continue; }
+                if (ch == '\'') { in_char = true; ++i; continue; }
+                if (text.compare(i, from.size(), from) == 0
+                    && (i == 0 || !(std::isalnum(static_cast<unsigned char>(text[i - 1])) || text[i - 1] == '_'))
+                    && (i + from.size() == text.size()
+                        || !(std::isalnum(static_cast<unsigned char>(text[i + from.size()])) || text[i + from.size()] == '_'))) {
+                    text.replace(i, from.size(), to);
+                    i += to.size();
+                    continue;
+                }
+                ++i;
+            }
+        };
+        auto parameters = cb_code.method_parameters.find(name);
+        if (parameters != cb_code.method_parameters.end() && parameters->second.size() >= 2) {
+            replace_identifier(source_body, parameters->second[0], "sender");
+            replace_identifier(source_body, parameters->second[1], "args");
+        }
+        body = codebehind_body_to_winui(source_body, known);
+    }
+    if (c.result && body.find("// ") != std::string::npos)
+        c.result->warnings.push_back("callback '" + name + "' contains statements that could not be lowered; source statements are retained as comments");
     // comment-only translation -> plain declaration (nothing expressible)
     bool has_real = false;
     {
@@ -3315,8 +3900,8 @@ export inline auto convert(xaml::ParseResult const& doc, lang::CodeBehind const&
             std::fprintf(stderr, "[x2w-cb] class=%s props=%zu found=%d\n",
                 codebehind.class_name.c_str(), codebehind.properties.size(), (int)codebehind.found);
             for (auto const& m : codebehind.properties)
-                std::fprintf(stderr, "[x2w-cb]   prop '%s' : '%s' static=%d\n",
-                    m.name.c_str(), m.type.c_str(), (int)m.is_static);
+                std::fprintf(stderr, "[x2w-cb]   prop '%s' : '%s' field=%d static=%d\n",
+                    m.name.c_str(), m.type.c_str(), (int)m.is_field, (int)m.is_static);
             std::fflush(stderr);
         }
     }
@@ -3360,8 +3945,9 @@ export inline auto convert(xaml::ParseResult const& doc, lang::CodeBehind const&
     // PASS 1: discover element x:Names, x:Bind roots & event handlers
     struct Walker {
         Converter& c;
-        auto walk(xaml::Node const& n) -> void {
+        auto walk(xaml::Node const& n, bool in_property_element = false) -> void {
             if (n.kind != xaml::NodeKind::Element) return;
+            bool property_element = in_property_element || n.name.find('.') != std::string::npos;
             // collect x:Name
             for (auto const& a : n.attrs) {
                 auto colon = a.name.find(':');
@@ -3369,6 +3955,12 @@ export inline auto convert(xaml::ParseResult const& doc, lang::CodeBehind const&
                 std::string prefix = (colon == std::string::npos) ? "" : a.name.substr(0, colon);
                 if (local == "Name" && prefix == "x") {
                     c.element_names[a.value] = n.name;
+                    if (in_property_element) {
+                        std::string element_type = n.name;
+                        if (auto const type_prefix = element_type.find(':'); type_prefix != std::string::npos)
+                            element_type = element_type.substr(type_prefix + 1);
+                        c.ensure_state_var(a.value, std::move(element_type));
+                    }
                 }
                 // event handlers (built-in + runtime JSON extensions). Events
                 // win first so `{x:Bind Handler}` event values register the
@@ -3391,7 +3983,7 @@ export inline auto convert(xaml::ParseResult const& doc, lang::CodeBehind const&
                     if (inner.find("x:Bind") != std::string::npos || inner.rfind("Binding", 0) == 0) {
                         std::string mode;
                         std::string target_null;
-                        std::string expr = translate_binding(inner, mode, &target_null);
+                        std::string expr = translate_binding(inner, mode, &target_null, &c.element_names);
                         if (!expr.empty()) c.record_binding_root(expr, mode, local, target_null);
                     }
                 }
@@ -3411,7 +4003,7 @@ export inline auto convert(xaml::ParseResult const& doc, lang::CodeBehind const&
                         continue;
                     }
                 }
-                walk(ch);
+                walk(ch, property_element);
             }
         }
     };
@@ -3498,8 +4090,9 @@ export inline auto convert(xaml::ParseResult const& doc, lang::CodeBehind const&
         em.blank();
         em.line("export view " + cls + " : " + base + " {");
         ++em.depth;
-        for (auto const& p : codebehind.properties)
+        for (auto const& p : codebehind.properties) {
             em.line("@state var " + p.name + ": " + sanitize_winui_type(p.type) + ";");
+        }
         for (auto const& cb : c.callbacks)
             emit_callback_decl(em, codebehind, c, cb);
         for (auto const& ev : codebehind.events) {
@@ -3539,7 +4132,14 @@ export inline auto convert(xaml::ParseResult const& doc, lang::CodeBehind const&
                 if (!stem.empty() && is_ident(stem)) res_view = stem + "Resources";
             }
         }
-        em.line("export view " + res_view + " {");
+        std::string resource_base;
+        if (root->name == "Application") {
+            resource_base = root->name;
+            if (auto const separator = resource_base.find_last_of(".:"); separator != std::string::npos)
+                resource_base = resource_base.substr(separator + 1);
+        }
+        em.line("export view " + res_view
+            + (resource_base.empty() ? "" : " : " + resource_base) + " {");
         ++em.depth;
         em.line("body {");
         ++em.depth;
@@ -3560,7 +4160,13 @@ export inline auto convert(xaml::ParseResult const& doc, lang::CodeBehind const&
         return res;
     }
 
-    em.line("export view " + view_name + " {");
+    std::string view_base = root->name;
+    if (auto const separator = view_base.find_last_of(".:"); separator != std::string::npos)
+        view_base = view_base.substr(separator + 1);
+    if (view_base.find(':') != std::string::npos || view_base.find('.') != std::string::npos)
+        view_base.clear();
+    em.line("export view " + view_name
+        + (view_base.empty() ? "" : " : " + view_base) + " {");
     ++em.depth;
 
     // state vars (deterministic order: as discovered). A state var whose name
@@ -3573,13 +4179,8 @@ export inline auto convert(xaml::ParseResult const& doc, lang::CodeBehind const&
         std::string name = decl.substr(0, colon);
         while (!name.empty() && (name.back() == ' ' || name.back() == '\t')) name.pop_back();
         if (name.empty()) return decl;
-        std::string name_lo;
-        for (char ch : name) name_lo += static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
         for (auto const& [xname, tag] : c.element_names) {
-            if (xname.size() != name.size()) continue;
-            std::string xlo;
-            for (char ch : xname) xlo += static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
-            if (xlo != name_lo) continue;
+            if (xname != name) continue;
             std::string t = tag;
             auto cc = t.find(':');
             if (cc != std::string::npos) t = t.substr(cc + 1);
@@ -3590,6 +4191,10 @@ export inline auto convert(xaml::ParseResult const& doc, lang::CodeBehind const&
         }
         return decl;
     };
+    auto is_named_element_state = [&](std::string const& name) -> bool {
+        auto element = c.element_names.find(name);
+        return element != c.element_names.end() && !element->second.empty();
+    };
     if (root->name == "UserControl") {
         for (auto const& p : codebehind.properties) {
             if (p.is_static || !is_ident(p.name)) continue;
@@ -3599,13 +4204,33 @@ export inline auto convert(xaml::ParseResult const& doc, lang::CodeBehind const&
             }
         }
     }
+    for (auto const& p : codebehind.properties) {
+        if (!p.is_field || p.is_static || !is_ident(p.name)) continue;
+        if (normalize_cb_type(p.type).empty()) continue;
+        std::string lc = lower_camel(p.name);
+        if (!c.state_set.count(lc) && !c.state_set.count(p.name)) {
+            c.ensure_state_var(lc, sanitize_winui_type(p.type));
+        }
+    }
     for (auto const& v : c.state_vars) {
-        em.line("@state var " + retype_element_state(v) + ";");
+        std::string declaration = retype_element_state(v);
+        auto colon = declaration.find(':');
+        if (colon != std::string::npos) {
+            std::string name = declaration.substr(0, colon);
+            while (!name.empty() && (name.back() == ' ' || name.back() == '\t')) name.pop_back();
+            auto type_end = declaration.find('=', colon + 1);
+            std::string type = declaration.substr(colon + 1, type_end == std::string::npos
+                ? std::string::npos : type_end - colon - 1);
+            auto type_begin = type.find_first_not_of(" \t");
+            auto trimmed_end = type.find_last_not_of(" \t");
+            bool supported = type_begin != std::string::npos
+                && is_neutral_state_type(type.substr(type_begin, trimmed_end - type_begin + 1));
+            if (!supported && !is_named_element_state(name)) continue;
+        }
+        em.line("@state var " + declaration + ";");
     }
     // two-way binding vars
-    for (auto const& v : c.binding_vars) {
-        em.line("@binding var " + v + ";");
-    }
+    for (auto const& v : c.binding_vars) em.line("@binding var " + v + ";");
     // callbacks
     for (auto const& cb : c.callbacks) {
         emit_callback_decl(em, codebehind, c, cb);
@@ -3644,11 +4269,14 @@ export inline auto convert(xaml::ParseResult const& doc, lang::CodeBehind const&
                 continue;
             }
             std::string handler = event_handler_value(a.value);
-            if (handler.empty()) continue;
             std::string wev = xaml_event_to_winui(a.name);
             if (auto xe = ext::ext_xaml_event(root->name, a.name)) wev = *xe;
-            c.ensure_callback(handler);
-            c.root_event_mods.push_back("." + wev + " { self." + handler + "(); }");
+            if (!handler.empty()) {
+                c.ensure_callback(handler);
+                c.root_event_mods.push_back("." + wev + " { self." + handler + "(); }");
+            } else if (std::string target = event_invocation_target(a.value); !target.empty()) {
+                c.root_event_mods.push_back("." + wev + " { self." + target + "(); }");
+            }
         }
     }
 
